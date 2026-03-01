@@ -1,0 +1,46 @@
+[package]
+name = "tts-server"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["metal"]
+metal = ["qwen3-tts/metal"]
+cuda = ["qwen3-tts/cuda"]
+flash-attn = ["qwen3-tts/flash-attn"]
+
+[dependencies]
+qwen3-tts = { path = "../crates/qwen3-tts", features = ["hub"] }
+
+# Web server
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "propagate-header"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1.0"
+byteorder = "1.5"
+hound = "3.5"
+tokio-stream = "0.1"
+
+# Candle (for Tensor/Device types in embedding module)
+candle-core = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

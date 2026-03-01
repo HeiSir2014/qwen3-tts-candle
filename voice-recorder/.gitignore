@@ -1,0 +1,6 @@
+data/
+node_modules/
+dist/
+certs/
+*.pyc
+__pycache__/

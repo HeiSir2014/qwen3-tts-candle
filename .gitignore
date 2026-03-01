@@ -1,0 +1,18 @@
+# Rust
+target/
+Cargo.lock
+
+# Node / Bun
+node_modules/
+*.lock
+!bun.lock
+
+# Data
+voice-recorder/data/
+voice-recorder/logs/
+voice-recorder/public/
+voice-recorder/.env
+
+# OS
+.DS_Store
+*.swp

@@ -1,0 +1,17 @@
+{
+  "name": "voice-recorder",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch run src/server.ts",
+    "build:ui": "cd ui && bun run build",
+    "dev:ui": "cd ui && bun run dev"
+  },
+  "dependencies": {
+    "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.9"
+  }
+}
