@@ -55,6 +55,14 @@ impl AppState {
         };
         tracing::info!("Model loaded successfully");
 
+        // Warmup: run a short synthesis to JIT-compile Metal/CUDA kernels
+        // so the first real request doesn't pay the compilation cost.
+        tracing::info!("Warming up model (short synthesis)...");
+        match model.synthesize("warmup", None) {
+            Ok(_) => tracing::info!("Warmup complete"),
+            Err(e) => tracing::warn!("Warmup synthesis failed (non-fatal): {}", e),
+        }
+
         Ok(Self {
             model: StdMutex::new(model),
             prompt_cache: TokioMutex::new(HashMap::new()),

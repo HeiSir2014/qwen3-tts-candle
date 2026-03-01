@@ -40,6 +40,17 @@ tokio-stream = "0.1"
 # Candle (for Tensor/Device types in embedding module)
 candle-core = "0.9"
 
+# HTTP client (for benchmark binary)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[[bin]]
+name = "tts-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "tts-bench"
+path = "src/bin/bench.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

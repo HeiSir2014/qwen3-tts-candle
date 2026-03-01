@@ -1488,7 +1488,7 @@ pub fn codes_to_tensor(codes: &[Vec<u32>], device: &Device) -> Result<Tensor> {
 
 /// Return the recommended compute dtype for the given device.
 ///
-/// - Metal: F16 (Apple Silicon has native F16 ALUs at 2x throughput)
+/// - Metal: BF16 (candle's Metal F16 path has precision issues; BF16 is correct)
 /// - CUDA: BF16 (NVIDIA Tensor Cores prefer BF16)
 /// - CPU: F32
 pub fn compute_dtype_for_device(device: &Device) -> DType {
@@ -1549,7 +1549,7 @@ pub struct StreamingSession<'a> {
     current_token: Option<u32>,
     current_token_tensor: Option<Tensor>,
     frames_generated: usize,
-    frame_buffer: FrameCodes,
+    frame_buffer: Vec<Tensor>,
     chunk_frames: usize,
     done: bool,
     // Trailing text state for residual VQ + text fusion
@@ -1568,7 +1568,8 @@ pub struct StreamingSession<'a> {
     // ICL reference codes for decoder context (voice cloning only).
     // When present, ref_codes are prepended to each chunk before decoding
     // and the corresponding audio prefix is trimmed from the output.
-    icl_ref_codes: Option<FrameCodes>,
+    // Stored as a GPU tensor [T_ref, 16] to avoid CPU roundtrips.
+    icl_ref_codes: Option<Tensor>,
     // Repetition detection: stop when the same semantic token repeats consecutively
     last_token: u32,
     repeat_count: usize,
@@ -1700,7 +1701,7 @@ impl<'a> StreamingSession<'a> {
         let (mut offset, mut last_hidden, mut logits) = Self::unpack_prefill(&prefill_result)?;
 
         // ICL extension if needed — mirrors synthesize_voice_clone_debug logic
-        let mut icl_ref_codes: Option<FrameCodes> = None;
+        let mut icl_ref_codes: Option<Tensor> = None;
         let trailing_text_hidden = if let (Some(ref_codes), Some(ref_text_ids)) =
             (&prompt.ref_codes, &prompt.ref_text_ids)
         {
@@ -1732,9 +1733,10 @@ impl<'a> StreamingSession<'a> {
                 logits = model.talker.apply_codec_head(&last_icl_hidden)?;
                 last_hidden = last_icl_hidden;
 
-                // Store ref_codes for decoder context: each chunk will prepend
-                // these frames and trim the corresponding audio prefix.
-                icl_ref_codes = Some(model.tensor_to_frame_codes(ref_codes)?);
+                // Store ref_codes tensor directly for decoder context: each chunk
+                // will prepend these frames and trim the corresponding audio prefix.
+                // Keeping as GPU tensor avoids per-frame CPU roundtrips.
+                icl_ref_codes = Some(ref_codes.to_dtype(DType::U32)?);
 
                 icl_trailing
             } else {
@@ -1794,7 +1796,7 @@ impl<'a> StreamingSession<'a> {
         trailing_text_len: usize,
         tts_pad_embed: Tensor,
         chunk_frames: usize,
-        icl_ref_codes: Option<FrameCodes>,
+        icl_ref_codes: Option<Tensor>,
     ) -> Result<Self> {
         // Build suppression mask once for reuse across all frames
         let suppression_mask = generation::build_suppression_mask(
@@ -1849,25 +1851,40 @@ impl<'a> StreamingSession<'a> {
         })
     }
 
+    /// Convert GPU frame tensors to the decoder's expected [1, 16, T] layout.
+    ///
+    /// Each frame is a [16] U32 tensor on GPU. We stack → [T, 16], transpose
+    /// → [16, T], unsqueeze → [1, 16, T], and cast to I64 for the decoder.
+    /// This stays entirely on GPU, avoiding the CPU transposition in `codes_to_tensor`.
+    fn gpu_frames_to_decoder_input(frames: &[Tensor]) -> Result<Tensor> {
+        let stacked = Tensor::stack(frames, 0)?; // [T, 16]
+        Ok(stacked.t()?.unsqueeze(0)?.to_dtype(DType::I64)?)
+    }
+
     /// Decode buffered frames to audio, applying ICL ref_codes context if present.
     ///
-    /// When `icl_ref_codes` is set, the reference frames are prepended before
-    /// decoding and the corresponding audio prefix is proportionally trimmed —
-    /// matching the non-streaming `synthesize_voice_clone_debug` logic.
-    fn decode_frame_buffer(&self, frames: &[Vec<u32>]) -> Result<AudioBuffer> {
-        if let Some(ref ref_codes) = self.icl_ref_codes {
-            let ref_len = ref_codes.len();
-            let mut combined = ref_codes.clone();
-            combined.extend_from_slice(frames);
-            let total_frames = combined.len();
-            let codes = self.model.codes_to_tensor(&combined)?;
-            let mut audio = AudioBuffer::from_tensor(self.model.decoder.decode(&codes)?, 24000)?;
+    /// All frame data stays on GPU — no CPU roundtrips. When `icl_ref_codes` is
+    /// set, the reference frames are prepended before decoding and the
+    /// corresponding audio prefix is proportionally trimmed.
+    fn decode_frame_buffer(&self, frames: &[Tensor]) -> Result<AudioBuffer> {
+        if let Some(ref ref_codes_tensor) = self.icl_ref_codes {
+            // ref_codes_tensor is [T_ref, 16] on GPU; frames are Vec<[16]> on GPU
+            let gen_stacked = Tensor::stack(frames, 0)?; // [T_gen, 16]
+            let combined = Tensor::cat(&[ref_codes_tensor, &gen_stacked], 0)?; // [T_total, 16]
+            let ref_len = ref_codes_tensor.dim(0)?;
+            let total_len = combined.dim(0)?;
+
+            // Transpose to decoder format: [1, 16, T]
+            let codes = combined.t()?.unsqueeze(0)?.to_dtype(DType::I64)?;
+            let mut audio =
+                AudioBuffer::from_tensor(self.model.decoder.decode(&codes)?, 24000)?;
+
             // Proportional cut matching Python reference implementation
-            let cut_samples = ref_len * audio.samples.len() / total_frames.max(1);
+            let cut_samples = ref_len * audio.samples.len() / total_len.max(1);
             audio.samples = audio.samples[cut_samples.min(audio.samples.len())..].to_vec();
             Ok(audio)
         } else {
-            let codes = self.model.codes_to_tensor(frames)?;
+            let codes = Self::gpu_frames_to_decoder_input(frames)?;
             let audio = self.model.decoder.decode(&codes)?;
             AudioBuffer::from_tensor(audio, 24000)
         }
@@ -1935,11 +1952,12 @@ impl<'a> StreamingSession<'a> {
                 &mut self.cp_kv_caches,
             )?;
 
-            // Build frame on GPU, then transfer for frame_buffer
-            let semantic_t = Tensor::new(&[token_id], self.model.device())?;
-            let frame_tensor = Tensor::cat(&[&semantic_t, &acoustic_codes_tensor], 0)?;
-            let frame_codes: Vec<u32> = frame_tensor.to_vec1()?;
-            self.frame_buffer.push(frame_codes);
+            // Build frame on GPU — stays GPU-resident, no CPU sync
+            let frame_tensor = Tensor::cat(
+                &[&token_tensor.reshape(1)?, &acoustic_codes_tensor],
+                0,
+            )?; // [16] on GPU
+            self.frame_buffer.push(frame_tensor);
 
             let frame_idx = self.frames_generated;
             self.frames_generated += 1;

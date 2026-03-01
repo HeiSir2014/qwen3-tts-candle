@@ -41,6 +41,9 @@ pub struct CloneStreamRequest {
     pub text: String,
     pub language: Option<String>,
     pub embedding_path: Option<String>,
+    /// Number of codec frames per streaming chunk (default: 10).
+    /// Lower = faster TTFB, higher = better throughput.
+    pub chunk_frames: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -217,6 +220,7 @@ pub async fn clone_stream(
     };
 
     let text = req.text.clone();
+    let chunk_frames_val = req.chunk_frames.unwrap_or(10);
     let state_clone = Arc::clone(&state);
     let rid2 = rid.clone();
 
@@ -252,7 +256,7 @@ pub async fn clone_stream(
                 top_k: 50,
                 top_p: 0.9,
                 repetition_penalty: 1.05,
-                chunk_frames: 10,
+                chunk_frames: chunk_frames_val,
                 ..Default::default()
             };
 

@@ -156,15 +156,14 @@ pub fn sample(
         return greedy_sample(&logits);
     }
 
-    // Apply top-k filtering
-    let logits = if config.top_k > 0 {
+    // Apply top-k + top-p filtering.
+    // When both are active, use a combined single-sort path to avoid
+    // the expensive double sort_last_dim on GPU.
+    let logits = if config.top_k > 0 && config.top_p < 1.0 && config.top_p > 0.0 {
+        top_k_top_p_filter(&logits, config.top_k, config.top_p)?
+    } else if config.top_k > 0 {
         top_k_filter(&logits, config.top_k)?
-    } else {
-        logits
-    };
-
-    // Apply top-p (nucleus) filtering
-    let logits = if config.top_p < 1.0 && config.top_p > 0.0 {
+    } else if config.top_p < 1.0 && config.top_p > 0.0 {
         top_p_filter(&logits, config.top_p)?
     } else {
         logits
@@ -208,6 +207,92 @@ fn top_k_filter(logits: &Tensor, k: usize) -> Result<Tensor> {
         let neg_inf =
             Tensor::new(&[f32::NEG_INFINITY], logits.device())?.broadcast_as(logits.shape())?;
         Ok(mask.where_cond(logits, &neg_inf)?)
+    }
+}
+
+/// Combined top-k + top-p in a single sort pass.
+///
+/// Avoids the overhead of sorting twice (once for top-k, once for top-p).
+/// Single sort → take top-k → cumulative probability cutoff for top-p.
+fn top_k_top_p_filter(logits: &Tensor, k: usize, p: f64) -> Result<Tensor> {
+    let (batch, vocab) = logits.dims2()?;
+    let k = k.min(vocab);
+
+    if logits.device().is_cpu() {
+        // CPU path: combined filter in Rust
+        let mut result_data = Vec::with_capacity(batch * vocab);
+        for b in 0..batch {
+            let row: Vec<f32> = logits.i(b)?.to_vec1()?;
+            let mut indices: Vec<usize> = (0..vocab).collect();
+            indices.sort_unstable_by(|&a, &b| {
+                row[b]
+                    .partial_cmp(&row[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Top-k cutoff
+            let top_k_indices = &indices[..k];
+
+            // Top-p cutoff within the top-k set
+            let max_val = row[top_k_indices[0]];
+            let mut exp_vals: Vec<f32> = top_k_indices
+                .iter()
+                .map(|&i| (row[i] - max_val).exp())
+                .collect();
+            let sum: f32 = exp_vals.iter().sum();
+            for v in &mut exp_vals {
+                *v /= sum;
+            }
+
+            let mut cumsum = 0.0f32;
+            let mut cutoff = k;
+            for (i, &prob) in exp_vals.iter().enumerate() {
+                cumsum += prob;
+                if cumsum > p as f32 {
+                    cutoff = i + 1;
+                    break;
+                }
+            }
+
+            let mut filtered = vec![f32::NEG_INFINITY; vocab];
+            for &idx in &top_k_indices[..cutoff] {
+                filtered[idx] = row[idx];
+            }
+            result_data.extend(filtered);
+        }
+        Ok(Tensor::new(result_data.as_slice(), logits.device())?.reshape((batch, vocab))?)
+    } else {
+        // GPU path: single sort, then apply both cutoffs
+        let (sorted_logits, _) = logits.sort_last_dim(false)?;
+
+        // Top-k threshold from sorted position
+        let threshold = sorted_logits.narrow(1, k - 1, 1)?;
+        let top_k_mask = logits.ge(&threshold.broadcast_as(logits.shape())?)?;
+
+        // Top-p: compute cumulative probability over the sorted (descending) logits
+        let sorted_probs = candle_nn::ops::softmax_last_dim(&sorted_logits)?;
+        let cumulative_probs = sorted_probs.cumsum(1)?;
+
+        // Shift cumulative probs right so position i has sum of probs 0..i (exclusive)
+        let shifted = cumulative_probs.narrow(1, 0, vocab - 1)?;
+        let zeros = Tensor::zeros((batch, 1), DType::F32, logits.device())?;
+        let shifted_cumsum = Tensor::cat(&[&zeros, &shifted], 1)?;
+
+        // Find the minimum logit value that falls within the nucleus (cumsum < p)
+        let threshold_val =
+            Tensor::new(&[p as f32], logits.device())?.broadcast_as(shifted_cumsum.shape())?;
+        let remove_mask = shifted_cumsum.ge(&threshold_val)?;
+        let pos_inf =
+            Tensor::new(&[f32::INFINITY], logits.device())?.broadcast_as(sorted_logits.shape())?;
+        let kept_logits = remove_mask.where_cond(&pos_inf, &sorted_logits)?;
+        let min_kept = kept_logits.min(D::Minus1)?.unsqueeze(1)?;
+        let top_p_mask = logits.ge(&min_kept.broadcast_as(logits.shape())?)?;
+
+        // Combine: keep only tokens that pass BOTH top-k and top-p
+        let combined_mask = top_k_mask.mul(&top_p_mask)?;
+        let neg_inf =
+            Tensor::new(&[f32::NEG_INFINITY], logits.device())?.broadcast_as(logits.shape())?;
+        Ok(combined_mask.where_cond(logits, &neg_inf)?)
     }
 }
 
