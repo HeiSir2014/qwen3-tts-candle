@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
-import type { Profile } from "../../types";
+import { SYSTEM_PROFILE_ID, type Profile, type SystemProfile } from "../../types";
 import { useI18n } from "../../i18n";
+import * as api from "../../api";
 import { DialogEditor } from "./DialogEditor";
 
 type Mode = "single" | "dialog";
@@ -23,6 +24,7 @@ interface Props {
     language: string,
     profileMapping: ProfileMapping
   ) => void;
+  onSystemSubmit: (voice: string, text: string, language: string) => void;
   onProfileChange: (profileId: string | null) => void;
   activeSegmentIndex: number | null;
 }
@@ -41,6 +43,7 @@ export function CloneForm({
   disabled,
   onSubmit,
   onDialogSubmit,
+  onSystemSubmit,
   onProfileChange,
   activeSegmentIndex,
 }: Props) {
@@ -55,6 +58,13 @@ export function CloneForm({
   // Dialog mode state — speaker names extracted from Tiptap content
   const [speakerNames, setSpeakerNames] = useState<string[]>([]);
 
+  // Preset voices; empty when the TTS backend has no CustomVoice model
+  const [systemProfiles, setSystemProfiles] = useState<SystemProfile[]>([]);
+  useEffect(() => {
+    api.getSystemProfiles().then(setSystemProfiles, () => {});
+  }, []);
+
+  const systemVoice = systemProfiles.find((v) => v.id === profileId);
   const profile = profiles.find((p) => p.id === profileId);
   const recordings = profile?.recordings ?? [];
 
@@ -95,11 +105,17 @@ export function CloneForm({
   const handleProfileChange = (id: string) => {
     setProfileId(id);
     setRecordingId("");
-    onProfileChange(id || null);
+    const isSystem = systemProfiles.some((v) => v.id === id);
+    onProfileChange(isSystem ? SYSTEM_PROFILE_ID : id || null);
   };
 
   const handleSubmit = () => {
     if (mode === "single") {
+      if (systemVoice) {
+        if (!singleText.trim()) return;
+        onSystemSubmit(systemVoice.id, singleText.trim(), language);
+        return;
+      }
       if (!profileId || !recordingId || !singleText.trim()) return;
       onSubmit(profileId, recordingId, singleText.trim(), language);
     } else {
@@ -116,7 +132,9 @@ export function CloneForm({
     []
   );
 
-  const singleValid = !!(profileId && recordingId && singleText.trim());
+  const singleValid = systemVoice
+    ? !!singleText.trim()
+    : !!(profileId && recordingId && singleText.trim());
   const dialogValid = !!(dialogText.trim() && speakerNames.length > 0 && unmatchedNames.length === 0);
   const canSubmit = !disabled && (mode === "single" ? singleValid : dialogValid);
 
@@ -151,33 +169,48 @@ export function CloneForm({
               onChange={(e) => handleProfileChange(e.target.value)}
             >
               <option value="">{t("select_profile")}</option>
-              {profiles.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.avatar} {p.name}
-                </option>
-              ))}
+              {systemProfiles.length > 0 && (
+                <optgroup label={t("system_voices_group")}>
+                  {systemProfiles.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      [{t("system_voice_badge")}] {v.name} — {v.description}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {profiles.length > 0 && (
+                <optgroup label={t("user_profiles_group")}>
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.avatar} {p.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </select>
           </div>
 
-          <div className="form-group">
-            <label>{t("clone_recording")}</label>
-            <select
-              value={recordingId}
-              onChange={(e) => setRecordingId(e.target.value)}
-            >
-              <option value="">{t("select_recording")}</option>
-              {recordings.map((r) => {
-                const label = r.scriptText
-                  ? r.scriptText.substring(0, 50) + "..."
-                  : r.id.substring(0, 8);
-                return (
-                  <option key={r.id} value={r.id}>
-                    [{embeddingIcon(r.embeddingStatus || "pending")}] {label}
-                  </option>
-                );
-              })}
-            </select>
-          </div>
+          {!systemVoice && (
+            <div className="form-group">
+              <label>{t("clone_recording")}</label>
+              <select
+                value={recordingId}
+                onChange={(e) => setRecordingId(e.target.value)}
+              >
+                <option value="">{t("select_recording")}</option>
+                {recordings.map((r) => {
+                  const label = r.scriptText
+                    ? r.scriptText.substring(0, 50) + "..."
+                    : r.id.substring(0, 8);
+                  return (
+                    <option key={r.id} value={r.id}>
+                      [{embeddingIcon(r.embeddingStatus || "pending")}] {label}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          )}
         </>
       )}
 

@@ -19,6 +19,15 @@ export interface Profile {
   recordingCount?: number;
 }
 
+/** Preset voice of the CustomVoice model; its jobs live under SYSTEM_PROFILE_ID. */
+export interface SystemProfile {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export const SYSTEM_PROFILE_ID = "__system__";
+
 export interface TtsJob {
   id: string;
   profileId: string;
@@ -32,7 +41,8 @@ export interface TtsJob {
   completedAt?: string;
   chunksCompleted?: number;
   chunksTotal?: number;
-  mode?: "single" | "dialog";
+  mode?: "single" | "dialog" | "tts";
+  voice?: string;
   dialogSegments?: { profileName: string; text: string }[];
   profileIds?: string[];
   audioDurationS?: number;

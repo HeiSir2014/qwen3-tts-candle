@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import type { Profile } from "../../types";
+import { SYSTEM_PROFILE_ID, type Profile } from "../../types";
 import { useI18n } from "../../i18n";
 import { useCloneJob } from "../../hooks/useCloneJob";
 import { useTtsHistory } from "../../hooks/useTtsHistory";
@@ -92,6 +92,18 @@ export function CloneLab({ profiles }: Props) {
     [cloneJob, showToast]
   );
 
+  const handleSystemSubmit = useCallback(
+    async (voice: string, text: string, language: string) => {
+      try {
+        const { jobId } = await api.ttsSubmit(voice, text, language);
+        cloneJob.watchExternalJob(jobId, SYSTEM_PROFILE_ID);
+      } catch (err: any) {
+        showToast(err.message);
+      }
+    },
+    [cloneJob, showToast]
+  );
+
   return (
     <>
       <div className="card">
@@ -117,6 +129,7 @@ export function CloneLab({ profiles }: Props) {
           disabled={cloneJob.downloading}
           onSubmit={handleSubmit}
           onDialogSubmit={handleDialogSubmit}
+          onSystemSubmit={handleSystemSubmit}
           onProfileChange={handleProfileChange}
           activeSegmentIndex={cloneJob.activeSegmentIndex}
         />

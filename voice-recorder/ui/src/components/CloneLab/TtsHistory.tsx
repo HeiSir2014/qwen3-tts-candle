@@ -97,7 +97,10 @@ export function TtsHistory({ history, onDelete, onPlayStart }: Props) {
           <div key={job.id} className="tts-history-item">
             <div className="tts-info">
               <div className="tts-text-preview">
-                {isDialog && <span className="dialog-badge">{t("dialog_badge")}</span>}{" "}
+                {isDialog && <span className="dialog-badge">{t("dialog_badge")}</span>}
+                {job.mode === "tts" && (
+                  <span className="dialog-badge">{t("system_voice_badge")} · {job.voice}</span>
+                )}{" "}
                 {preview}
               </div>
               <div className="tts-meta">

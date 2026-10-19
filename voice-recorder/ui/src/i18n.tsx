@@ -83,6 +83,9 @@ const strings = {
     audio_duration: "Audio",
     rtf_label: "RTF",
     unmatched_speakers: "No matching profile for",
+    system_voice_badge: "Built-in",
+    system_voices_group: "Built-in Voices",
+    user_profiles_group: "My Profiles",
   },
   zh: {
     title: "声音实验室",
@@ -157,6 +160,9 @@ const strings = {
     audio_duration: "音频",
     rtf_label: "RTF",
     unmatched_speakers: "未匹配到声音档案",
+    system_voice_badge: "内置",
+    system_voices_group: "内置角色",
+    user_profiles_group: "我的档案",
   },
 } as const;
 

@@ -1,0 +1,12 @@
+[project]
+name = "mlx-tts-server"
+version = "0.1.0"
+description = "Qwen3-TTS server on Apple MLX, protocol-compatible with tts-server"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.1",
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git@1865f49",
+]
+
+[tool.uv]
+package = false
