@@ -11,6 +11,9 @@ use super::causal_conv::CausalConvState;
 use super::decoder_block::DecoderBlockState;
 use super::{CausalConv1d, CausalTransConv1d, ConvNeXtBlock, DecoderBlock, SnakeBeta};
 
+/// Frames per pass in [`Decoder12Hz::decode`].
+const DECODE_CHUNK_FRAMES: usize = 50;
+
 /// Configuration for the 12Hz decoder
 #[derive(Debug, Clone)]
 pub struct Decoder12HzConfig {
@@ -441,13 +444,35 @@ impl Decoder12Hz {
 
     /// Decode codec tokens to audio waveform
     ///
+    /// Long inputs are decoded in [`DECODE_CHUNK_FRAMES`] pieces through
+    /// [`Self::decode_with_state`], which gives the same audio as one pass
+    /// while bounding activation memory: the audio-rate layers hold
+    /// ~`frames * 1920 * 96 * kernel` floats, i.e. several GB per tensor for
+    /// a ~30 s utterance in one pass.
+    ///
     /// # Arguments
     /// * `codes` - Token indices of shape [batch, num_quantizers, seq_len]
     ///
     /// # Returns
     /// Audio tensor of shape [batch, 1, samples]
     pub fn decode(&self, codes: &Tensor) -> Result<Tensor> {
-        self.decode_with_state(codes, &mut DecoderStreamState::default())
+        self.decode_in_chunks(codes, DECODE_CHUNK_FRAMES)
+    }
+
+    fn decode_in_chunks(&self, codes: &Tensor, chunk_frames: usize) -> Result<Tensor> {
+        let mut state = DecoderStreamState::default();
+        let total = codes.dim(2)?;
+        if total <= chunk_frames {
+            return self.decode_with_state(codes, &mut state);
+        }
+        let chunks = (0..total)
+            .step_by(chunk_frames)
+            .map(|start| {
+                let len = chunk_frames.min(total - start);
+                self.decode_with_state(&codes.narrow(2, start, len)?, &mut state)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Tensor::cat(&chunks, 2)?)
     }
 
     /// Incrementally decode the next codes of a stream.
@@ -818,6 +843,50 @@ impl Decoder12Hz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chunked decoding must reproduce a single pass. Needs the speech
+    /// tokenizer weights in the local HuggingFace cache:
+    /// `cargo test --release -p qwen3-tts --lib chunked_decode -- --ignored`
+    #[test]
+    #[ignore = "needs cached speech tokenizer weights; slow in debug builds"]
+    fn test_chunked_decode_matches_single_pass() {
+        let Some(weights_path) = std::env::var_os("HOME")
+            .map(|home| {
+                std::path::Path::new(&home)
+                    .join(".cache/huggingface/hub/models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots")
+            })
+            .and_then(|dir| std::fs::read_dir(dir).ok()?.flatten().next())
+            .map(|snapshot| snapshot.path().join("model.safetensors"))
+            .filter(|path| path.exists())
+        else {
+            eprintln!("speech tokenizer weights not cached; skipping");
+            return;
+        };
+        let device = candle_core::Device::Cpu;
+        let weights = candle_core::safetensors::load(weights_path, &device).unwrap();
+        let decoder = Decoder12Hz::from_weights(&weights, Decoder12HzConfig::default()).unwrap();
+
+        let codes = Tensor::rand(0f32, 2047.0, (1, 16, 7), &device)
+            .unwrap()
+            .to_dtype(DType::I64)
+            .unwrap();
+        let single = decoder
+            .decode_with_state(&codes, &mut DecoderStreamState::default())
+            .unwrap();
+        let chunked = decoder.decode_in_chunks(&codes, 3).unwrap();
+        assert_eq!(single.dims(), chunked.dims());
+        let max_diff: f32 = (single - chunked)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(max_diff < 1e-4, "max diff {max_diff}");
+    }
 
     #[test]
     fn test_config_default() {
