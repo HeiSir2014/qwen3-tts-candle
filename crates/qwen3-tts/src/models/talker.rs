@@ -408,8 +408,10 @@ impl TalkerModel {
         let rope = if let Some(mrope_section) = config.mrope_section {
             RoPEType::Multimodal(MRoPE::new(
                 config.head_dim,
+                config.max_position_embeddings,
                 config.rope_theta,
                 mrope_section,
+                dtype,
                 device,
             )?)
         } else {
@@ -417,6 +419,7 @@ impl TalkerModel {
                 config.head_dim,
                 config.max_position_embeddings,
                 config.rope_theta,
+                dtype,
                 device,
             )?)
         };

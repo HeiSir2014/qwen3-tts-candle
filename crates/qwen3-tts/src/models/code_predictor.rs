@@ -209,6 +209,7 @@ impl CodePredictor {
             config.head_dim,
             1024, // Max sequence length for code predictor
             config.rope_theta,
+            vb.dtype(),
             vb.device(),
         )?);
 

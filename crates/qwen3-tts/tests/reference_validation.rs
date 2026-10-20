@@ -1061,6 +1061,7 @@ fn test_model_module_matches_reference() -> Result<()> {
         config.head_dim(),
         512,
         config.rope_theta,
+        DType::F32,
         &device,
     )?);
 

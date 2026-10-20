@@ -4,7 +4,7 @@
 //! and `DecoderLayer` — used by both `TalkerModel` and `CodePredictor`.
 
 use anyhow::Result;
-use candle_core::{Device, IndexOp, Module, Tensor, D};
+use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 
 use super::fused_ops::FusedRmsNorm;
@@ -35,47 +35,23 @@ pub fn create_causal_mask(seq_len: usize, offset: usize, device: &Device) -> Res
     Ok(Tensor::new(mask.as_slice(), device)?.reshape((1, 1, seq_len, total_len))?)
 }
 
-/// Apply RoPE rotation to a tensor.
-///
-/// `x` has shape `[batch, heads, seq_len, head_dim]`.
-/// `cos` and `sin` have shape `[seq_len, head_dim/2]`.
-fn apply_rope_rotation(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (_b, _h, _seq, d) = x.dims4()?;
-    let x1 = x.narrow(D::Minus1, 0, d / 2)?;
-    let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
-
-    // Broadcast cos/sin from [seq_len, half_dim] to [1, 1, seq_len, half_dim]
-    let cos = cos
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .to_dtype(x.dtype())?
-        .broadcast_as(x1.shape())?;
-    let sin = sin
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .to_dtype(x.dtype())?
-        .broadcast_as(x1.shape())?;
-
-    // Standard RoPE: [x1*cos - x2*sin, x2*cos + x1*sin]
-    let rotated = Tensor::cat(
-        &[
-            &(x1.mul(&cos)? - x2.mul(&sin)?)?,
-            &(x2.mul(&cos)? + x1.mul(&sin)?)?,
-        ],
-        D::Minus1,
-    )?;
-
-    Ok(rotated)
-}
-
 /// Rotary position embedding (standard RoPE)
+///
+/// Holds precomputed `[max_seq_len, head_dim/2]` cos/sin tables in the
+/// compute dtype so each step is a table slice plus one fused rope kernel.
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
 }
 
 impl RotaryEmbedding {
-    pub fn new(dim: usize, max_seq_len: usize, theta: f64, device: &Device) -> Result<Self> {
+    pub fn new(
+        dim: usize,
+        max_seq_len: usize,
+        theta: f64,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let inv_freq: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1.0 / (theta as f32).powf(i as f32 / dim as f32))
@@ -86,19 +62,21 @@ impl RotaryEmbedding {
         let positions = Tensor::new(positions.as_slice(), device)?.unsqueeze(1)?;
 
         let freqs = positions.matmul(&inv_freq.unsqueeze(0)?)?;
-        let cos = freqs.cos()?;
-        let sin = freqs.sin()?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
 
         Ok(Self { cos, sin })
     }
 
+    /// Rotate `q` and `k` laid out as `[batch, seq_len, heads, head_dim]`
+    /// (before the heads/seq transpose), starting at position `offset`.
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let seq_len = q.dim(2)?;
-        let cos = self.cos.i(offset..offset + seq_len)?;
-        let sin = self.sin.i(offset..offset + seq_len)?;
+        let seq_len = q.dim(1)?;
+        let cos = self.cos.narrow(0, offset, seq_len)?;
+        let sin = self.sin.narrow(0, offset, seq_len)?;
 
-        let q_rot = apply_rope_rotation(q, &cos, &sin)?;
-        let k_rot = apply_rope_rotation(k, &cos, &sin)?;
+        let q_rot = candle_nn::rotary_emb::rope_thd(&q.contiguous()?, &cos, &sin)?;
+        let k_rot = candle_nn::rotary_emb::rope_thd(&k.contiguous()?, &cos, &sin)?;
 
         Ok((q_rot, k_rot))
     }
@@ -106,78 +84,26 @@ impl RotaryEmbedding {
 
 /// Multimodal Rotary Embedding (MRoPE) for 3D positions (temporal, height, width)
 ///
-/// Uses interleaved layout matching Qwen3-TTS's rope_scaling configuration.
-/// For TTS, all 3 position dimensions use the same value, but the interleaving
-/// still affects how frequencies are distributed across the head dimension.
+/// Qwen3-TTS uses interleaved MRoPE (`mrope_section` = `[24, 20, 20]`), but
+/// for TTS all three position ids are identical, so every frequency sees the
+/// same position and the interleaving is a no-op: MRoPE reduces exactly to
+/// standard RoPE over `max_seq_len` positions.
 pub struct MRoPE {
-    inv_freq: Tensor,
-    device: Device,
+    rope: RotaryEmbedding,
 }
 
 impl MRoPE {
-    /// Create MRoPE with specified mrope_section
-    ///
-    /// mrope_section = [24, 20, 20] means:
-    /// - 24 frequency pairs for temporal (T)
-    /// - 20 frequency pairs for height (H)
-    /// - 20 frequency pairs for width (W)
-    ///
-    /// Total = 64 = head_dim / 2
     pub fn new(
         dim: usize,
+        max_seq_len: usize,
         theta: f64,
         _mrope_section: [usize; 3],
+        dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        // Compute inverse frequencies
-        let inv_freq: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1.0 / (theta as f32).powf(i as f32 / dim as f32))
-            .collect();
-        let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
-
         Ok(Self {
-            inv_freq,
-            device: device.clone(),
+            rope: RotaryEmbedding::new(dim, max_seq_len, theta, dtype, device)?,
         })
-    }
-
-    /// Apply MRoPE to query and key tensors
-    ///
-    /// For TTS, all 3 position dimensions (T, H, W) use the same position value,
-    /// but the interleaving still changes how frequencies are distributed.
-    ///
-    /// Arguments:
-    /// - q, k: [batch, heads, seq_len, head_dim]
-    /// - offset: position offset for KV cache
-    /// - seq_len: sequence length
-    pub fn apply(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        offset: usize,
-        seq_len: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        // Generate position IDs for all 3 dimensions (same values for TTS)
-        let positions: Vec<f32> = (offset..offset + seq_len).map(|i| i as f32).collect();
-        let pos = Tensor::new(positions.as_slice(), &self.device)?; // [seq_len]
-
-        // Compute frequencies for each dimension
-        // freqs = pos[:, None] * inv_freq[None, :] -> [seq_len, head_dim/2]
-        let pos_col = pos.unsqueeze(1)?; // [seq_len, 1]
-        let inv_freq_row = self.inv_freq.unsqueeze(0)?; // [1, head_dim/2]
-        let freqs = pos_col.matmul(&inv_freq_row)?; // [seq_len, head_dim/2]
-
-        // For TTS, all 3 dimensions have the same position, so freqs_t = freqs_h = freqs_w.
-        // The interleaving is a no-op when all positions are identical.
-        // freqs is already [seq_len, head_dim/2] — compute cos/sin directly.
-        let cos = freqs.cos()?;
-        let sin = freqs.sin()?;
-
-        let q_rot = apply_rope_rotation(q, &cos, &sin)?;
-        let k_rot = apply_rope_rotation(k, &cos, &sin)?;
-
-        Ok((q_rot, k_rot))
     }
 }
 
@@ -188,14 +114,12 @@ pub enum RoPEType {
 }
 
 impl RoPEType {
-    /// Apply rotary embedding to Q and K tensors
+    /// Apply rotary embedding to Q and K tensors laid out as
+    /// `[batch, seq_len, heads, head_dim]`.
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         match self {
             RoPEType::Standard(rope) => rope.apply(q, k, offset),
-            RoPEType::Multimodal(mrope) => {
-                let seq_len = q.dim(2)?;
-                mrope.apply(q, k, offset, seq_len)
-            }
+            RoPEType::Multimodal(mrope) => mrope.rope.apply(q, k, offset),
         }
     }
 }
@@ -268,13 +192,13 @@ impl Attention {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
+        // Apply rotary embeddings (fused, on the [batch, seq, heads, head_dim] layout)
+        let (q, k) = rope.apply(&q, &k, offset)?;
+
         // Transpose to [batch, heads, seq, head_dim]
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-
-        // Apply rotary embeddings
-        let (q, k) = rope.apply(&q, &k, offset)?;
 
         // Update KV cache
         let (k, v) = if let Some(cache) = kv_cache {
@@ -323,10 +247,14 @@ impl Attention {
             }
             #[cfg(not(feature = "flash-attn"))]
             unreachable!()
-        } else if q.device().is_metal() && attention_mask.is_none() {
-            // Metal SDPA for decode steps (seq_len=1, no mask needed).
-            // K,V from PreAllocKVCache are non-contiguous narrow views.
-            // Metal SDPA kernel receives k/v strides and handles them natively.
+        } else if q.device().is_metal() {
+            // Metal SDPA (vector kernel for decode, full kernel for prefill).
+            // Every mask in this crate is the causal mask from
+            // `create_causal_mask`, which SDPA's bottom-right aligned
+            // `do_causal` reproduces, so the mask tensor is not needed.
+            // K,V from PreAllocKVCache are non-contiguous narrow views;
+            // the Metal SDPA kernels take k/v strides and handle them natively.
+            let _ = attention_mask;
             let q = q.contiguous()?;
             let attn_output = candle_nn::ops::sdpa(
                 &q,
@@ -471,7 +399,6 @@ pub use super::kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
     use candle_nn::VarMap;
 
     fn create_mock_vb(device: &Device) -> VarBuilder<'static> {
@@ -497,7 +424,7 @@ mod tests {
     #[test]
     fn test_rotary_embedding_creation() {
         let device = Device::Cpu;
-        let rope = RotaryEmbedding::new(64, 512, 10000.0, &device).unwrap();
+        let rope = RotaryEmbedding::new(64, 512, 10000.0, DType::F32, &device).unwrap();
         // Verify cos/sin shapes match expected dim
         assert_eq!(rope.cos.dims()[1], 32); // dim / 2
     }
@@ -505,7 +432,7 @@ mod tests {
     #[test]
     fn test_rotary_embedding_shape() {
         let device = Device::Cpu;
-        let rope = RotaryEmbedding::new(64, 512, 10000.0, &device).unwrap();
+        let rope = RotaryEmbedding::new(64, 512, 10000.0, DType::F32, &device).unwrap();
 
         // cos and sin should be [max_seq_len, dim/2]
         assert_eq!(rope.cos.dims()[0], 512);
@@ -517,7 +444,7 @@ mod tests {
     #[test]
     fn test_rotary_embedding_apply() {
         let device = Device::Cpu;
-        let rope = RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap();
+        let rope = RotaryEmbedding::new(16, 512, 10000.0, DType::F32, &device).unwrap();
 
         // q, k: [batch, heads, seq, head_dim]
         let q = Tensor::randn(0.0f32, 1.0, (2, 4, 10, 16), &device).unwrap();
@@ -532,7 +459,7 @@ mod tests {
     #[test]
     fn test_rotary_embedding_with_offset() {
         let device = Device::Cpu;
-        let rope = RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap();
+        let rope = RotaryEmbedding::new(16, 512, 10000.0, DType::F32, &device).unwrap();
 
         let q = Tensor::randn(0.0f32, 1.0, (1, 2, 5, 16), &device).unwrap();
         let k = Tensor::randn(0.0f32, 1.0, (1, 2, 5, 16), &device).unwrap();
@@ -613,7 +540,9 @@ mod tests {
         let vb = create_mock_vb(&device);
 
         let attn = Attention::new(&config, vb).unwrap();
-        let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
+        let rope = RoPEType::Standard(
+            RotaryEmbedding::new(16, 512, 10000.0, DType::F32, &device).unwrap(),
+        );
 
         // Input: [batch=1, seq=10, hidden=64]
         let input = Tensor::randn(0.0f32, 1.0, (1, 10, 64), &device).unwrap();
@@ -629,7 +558,9 @@ mod tests {
         let vb = create_mock_vb(&device);
 
         let attn = Attention::new(&config, vb).unwrap();
-        let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
+        let rope = RoPEType::Standard(
+            RotaryEmbedding::new(16, 512, 10000.0, DType::F32, &device).unwrap(),
+        );
         let mut cache = AnyKVCache::Concat(KVCache::new());
 
         // First forward
@@ -654,7 +585,9 @@ mod tests {
         let vb = create_mock_vb(&device);
 
         let layer = DecoderLayer::new(&config, vb).unwrap();
-        let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
+        let rope = RoPEType::Standard(
+            RotaryEmbedding::new(16, 512, 10000.0, DType::F32, &device).unwrap(),
+        );
         let mut cache = AnyKVCache::Concat(KVCache::new());
 
         let input = Tensor::randn(0.0f32, 1.0, (1, 8, 64), &device).unwrap();
@@ -672,6 +605,92 @@ mod tests {
             (0..2).map(|_| AnyKVCache::Concat(KVCache::new())).collect();
         // Just verify KV caches can be created
         assert_eq!(kv_caches.len(), 2);
+    }
+
+    /// Metal (SDPA + pre-allocated KV cache) must match the CPU reference
+    /// path for a causal prefill, a second prefill chunk on top of the cache
+    /// (as ICL prompting does) and single-token decode steps.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_attention_matches_cpu() {
+        use std::collections::HashMap;
+
+        let Ok(metal) = Device::new_metal(0) else {
+            return;
+        };
+        let config = Qwen3TTSConfig {
+            hidden_size: 256,
+            num_attention_heads: 4,
+            num_key_value_heads: Some(2),
+            head_dim_override: Some(64),
+            ..small_config()
+        };
+        let (h, d, kv) = (256, 64, 2);
+        let cpu = Device::Cpu;
+        let weights: HashMap<String, Tensor> = [
+            ("q_proj.weight", (4 * d, h)),
+            ("k_proj.weight", (kv * d, h)),
+            ("v_proj.weight", (kv * d, h)),
+            ("o_proj.weight", (h, 4 * d)),
+        ]
+        .into_iter()
+        .map(|(name, shape)| {
+            let w = Tensor::randn(0.0f32, 0.05, shape, &cpu).unwrap();
+            (name.to_string(), w)
+        })
+        .chain(
+            ["q_norm.weight", "k_norm.weight"]
+                .into_iter()
+                .map(|name| (name.to_string(), Tensor::ones(d, DType::F32, &cpu).unwrap())),
+        )
+        .collect();
+        let input = Tensor::randn(0.0f32, 1.0, (1, 10, h), &cpu).unwrap();
+
+        let run = |device: &Device, mut cache: AnyKVCache| -> Vec<f32> {
+            let weights = weights
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_device(device).unwrap()))
+                .collect();
+            let vb = VarBuilder::from_tensors(weights, DType::F32, device);
+            let attn = Attention::new(&config, vb).unwrap();
+            let rope = RoPEType::Standard(
+                RotaryEmbedding::new(d, 64, 10000.0, DType::F32, device).unwrap(),
+            );
+            let x = input.to_device(device).unwrap();
+            let mut out = Vec::new();
+            for (start, len) in [(0, 5), (5, 2)] {
+                let mask = create_causal_mask(len, start, device).unwrap();
+                let chunk = x.narrow(1, start, len).unwrap();
+                let y = attn
+                    .forward(&chunk, &rope, Some(&mask), Some(&mut cache), start)
+                    .unwrap();
+                out.extend(y.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            }
+            for pos in 7..10 {
+                let step = attn
+                    .forward(
+                        &x.narrow(1, pos, 1).unwrap(),
+                        &rope,
+                        None,
+                        Some(&mut cache),
+                        pos,
+                    )
+                    .unwrap();
+                out.extend(step.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            }
+            out
+        };
+
+        let expected = run(&cpu, AnyKVCache::Concat(KVCache::new()));
+        let cache = PreAllocKVCache::new(1, kv, 16, d, DType::F32, &metal).unwrap();
+        let actual = run(&metal, AnyKVCache::PreAlloc(cache));
+
+        let max_diff = expected
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-3, "metal vs cpu max diff {max_diff}");
     }
 
     #[test]
