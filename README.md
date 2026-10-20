@@ -48,8 +48,8 @@ Text ──→ [TalkerModel] ──→ semantic tokens (1 per frame)
 
 ### Prerequisites
 
-- **Rust** (1.75+) — [rustup.rs](https://rustup.rs), for the `rust` backend
-- **uv** — [docs.astral.sh/uv](https://docs.astral.sh/uv/), for the `mlx` backend (Apple Silicon)
+- **Rust** (1.75+) — [rustup.rs](https://rustup.rs), for the default `rust` backend
+- **uv** (optional) — [docs.astral.sh/uv](https://docs.astral.sh/uv/), only for the `mlx` backend (Apple Silicon)
 - **Bun** (optional, for Voice Recorder UI) — [bun.sh](https://bun.sh)
 
 ### One-command startup (server + UI)
@@ -62,7 +62,7 @@ bash scripts/start.sh
 
 This will:
 
-1. Prepare the TTS backend: `uv sync` for `mlx`, or a release build of the Rust server for `rust`
+1. Prepare the TTS backend: a release build of the Rust server for `rust`, or `uv sync` for `mlx`
 2. Install Bun dependencies for the Voice Recorder UI
 3. Start the Bun server (auto-launches the selected TTS server)
 
@@ -80,13 +80,15 @@ Both implement the same HTTP API and binary streaming protocol.
 
 | Backend | Server | Platform | Notes |
 |---------|--------|----------|-------|
-| `mlx` | `mlx-server/` (Python, [mlx-audio](https://github.com/Blaizzy/mlx-audio)) | Apple Silicon | Default on macOS; adds CustomVoice preset speakers |
-| `rust` | `tts-server/` (Candle) | CUDA / CPU / Metal | Default elsewhere |
+| `rust` | `tts-server/` (Candle) | Metal / CUDA / CPU | Default everywhere |
+| `mlx` | `mlx-server/` (Python, [mlx-audio](https://github.com/Blaizzy/mlx-audio)) | Apple Silicon | Optional; can load quantized (4/8-bit) MLX checkpoints |
+
+Both serve voice cloning and the 9 CustomVoice preset speakers.
 
 Select it in `voice-recorder/.env`:
 
 ```bash
-TTS_BACKEND=mlx            # or rust
+TTS_BACKEND=rust           # or mlx
 # TTS_MLX_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16          (default)
 # TTS_MLX_CV_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit (default; empty disables preset voices)
 ```
@@ -120,6 +122,7 @@ CLI flags:
 |------|---------|-------------|
 | `--port` | `5001` | HTTP listen port |
 | `--model-path` | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Local path or HuggingFace model ID |
+| `--custom-voice-model` | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Model for the preset speakers; `""` disables them |
 | `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `metal` |
 | `--log-dir` | `logs` | Rolling daily log output directory |
 
@@ -160,8 +163,8 @@ let audio = model.synthesize("Custom settings!", Some(options))?;
 | `POST` | `/extract-embedding` | Precompute the voice prompt from reference audio (`.bin` for rust, `.npz` for mlx) |
 | `POST` | `/clone-stream` | Voice clone with streaming binary frame response |
 | `POST` | `/cache/clear` | Clear in-memory prompt cache (rust only) |
-| `GET` | `/speakers` | CustomVoice preset speakers (mlx only) |
-| `POST` | `/tts-stream` | Preset-speaker synthesis `{voice, text, language}`, same frame protocol (mlx only) |
+| `GET` | `/speakers` | CustomVoice preset speakers (empty when disabled) |
+| `POST` | `/tts-stream` | Preset-speaker synthesis `{voice, text, language}`, same frame protocol |
 
 ### Streaming protocol
 
@@ -200,6 +203,21 @@ cargo build --release -p tts-server --no-default-features --features cuda
 # CPU only
 cargo build --release -p tts-server --no-default-features --features cpu
 ```
+
+Windows + CUDA 13.x: build from a Visual Studio developer shell. candle-kernels
+0.11 needs MSVC's conforming preprocessor there
+([huggingface/candle#3686](https://github.com/huggingface/candle/issues/3686)):
+
+```powershell
+$env:CUDA_COMPUTE_CAP = "86"   # your GPU's compute capability, e.g. 86 for RTX 30xx
+$env:NVCC_PREPEND_FLAGS = "-Xcompiler /Zc:preprocessor"
+cargo build --release -p tts-server --no-default-features --features cuda
+```
+
+The fused SnakeBeta/SwiGLU kernels and the SDPA prefill path are Metal-only;
+other backends fall back to plain tensor ops. The algorithmic speedups
+(incremental streaming decoder, host-side sampling, fused RoPE, single prefill)
+apply to every backend.
 
 ## Project Structure
 
