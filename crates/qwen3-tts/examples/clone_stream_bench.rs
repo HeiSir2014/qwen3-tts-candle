@@ -11,7 +11,8 @@
 
 use anyhow::Result;
 use qwen3_tts::{
-    auto_device, AudioBuffer, Language, ModelPaths, Qwen3TTS, StreamingProfile, SynthesisOptions,
+    auto_device, sync_device, AudioBuffer, Language, ModelPaths, Qwen3TTS, StreamingProfile,
+    SynthesisOptions,
 };
 use std::time::Instant;
 
@@ -34,6 +35,8 @@ const CORPUS: &[(&str, &str)] = &[
 ];
 
 struct RunResult {
+    prompt_ms: f64,
+    prefill_ms: f64,
     ttfb_ms: f64,
     total_ms: f64,
     audio_s: f64,
@@ -64,8 +67,12 @@ fn run_once(
     // Prompt extraction is included in TTFB, as in mlx-audio's generate().
     let start = Instant::now();
     let prompt = model.create_voice_clone_prompt(ref_audio, Some(ref_text))?;
+    sync_device(model.device())?;
+    let prompt_ms = start.elapsed().as_secs_f64() * 1000.0;
+    // Session creation runs the prefill and reads back the first token.
     let mut session =
         model.synthesize_voice_clone_streaming(text, &prompt, Language::Chinese, options)?;
+    let prefill_ms = start.elapsed().as_secs_f64() * 1000.0 - prompt_ms;
     if profile {
         session.enable_profiling();
     }
@@ -81,6 +88,8 @@ fn run_once(
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     let audio = AudioBuffer::new(samples, 24000);
     Ok(RunResult {
+        prompt_ms,
+        prefill_ms,
         ttfb_ms: ttfb_ms.unwrap_or(total_ms),
         total_ms,
         audio_s: audio.duration() as f64,
@@ -119,9 +128,12 @@ fn main() -> Result<()> {
         let n = runs.len() as f64;
         let avg = |f: fn(&RunResult) -> f64| runs.iter().map(f).sum::<f64>() / n;
         println!(
-            "{label}: rtf={:.3} ttfb={:.0}ms total={:.0}ms audio={:.2}s chunks={:.1}",
+            "{label}: rtf={:.3} ttfb={:.0}ms (prompt={:.0} prefill={:.0}) total={:.0}ms \
+             audio={:.2}s chunks={:.1}",
             avg(|r| r.total_ms / 1000.0 / r.audio_s),
             avg(|r| r.ttfb_ms),
+            avg(|r| r.prompt_ms),
+            avg(|r| r.prefill_ms),
             avg(|r| r.total_ms),
             avg(|r| r.audio_s),
             avg(|r| r.chunks as f64),
