@@ -15,6 +15,8 @@ use anyhow::Result;
 use candle_core::{Device, Module, Tensor, D};
 use candle_nn::{conv1d, Conv1d, Conv1dConfig, VarBuilder};
 
+use super::codec::causal_conv::{conv1d_stacked_taps, tap_major_weight};
+
 use crate::audio::{AudioBuffer, MelSpectrogram};
 use crate::models::config::SpeakerEncoderConfig;
 
@@ -66,7 +68,10 @@ fn sigmoid(x: &Tensor) -> Result<Tensor> {
 ///
 /// Matches PyTorch's `Conv1d(padding="same", padding_mode="reflect")`.
 struct ReflectPadConv1d {
-    conv: Conv1d,
+    /// Tap-major weight with bias column (see `conv1d_stacked_taps`)
+    gemm_weight: Tensor,
+    kernel_size: usize,
+    dilation: usize,
     pad_left: usize,
     pad_right: usize,
 }
@@ -94,7 +99,9 @@ impl ReflectPadConv1d {
         let conv = conv1d(in_channels, out_channels, kernel_size, config, vb)?;
 
         Ok(Self {
-            conv,
+            gemm_weight: tap_major_weight(conv.weight(), conv.bias())?,
+            kernel_size,
+            dilation,
             pad_left,
             pad_right,
         })
@@ -102,7 +109,13 @@ impl ReflectPadConv1d {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let padded = reflect_pad_1d(x, self.pad_left, self.pad_right)?;
-        Ok(self.conv.forward(&padded)?)
+        conv1d_stacked_taps(
+            &padded,
+            &self.gemm_weight,
+            self.kernel_size,
+            1,
+            self.dilation,
+        )
     }
 }
 
