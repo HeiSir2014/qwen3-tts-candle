@@ -20,7 +20,7 @@ all-portable = ["cpu", "cli", "hub"]
 #   macOS:         metal, accelerate
 #   Linux + Intel: mkl
 #   Linux + NVIDIA: cuda, flash-attn
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:candle-metal-kernels"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
@@ -33,6 +33,8 @@ candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
 candle-flash-attn = { version = "0.11", optional = true }
+# Custom fused Metal kernels (same version candle-core uses)
+candle-metal-kernels = { version = "0.11", optional = true }
 
 # Tokenization (HuggingFace tokenizers in Rust)
 tokenizers = "0.22"
