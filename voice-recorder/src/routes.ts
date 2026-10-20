@@ -46,6 +46,9 @@ import {
 
 const log = createLogger("routes");
 
+/** Longest style instruction accepted for preset voices. */
+const MAX_INSTRUCT_LENGTH = 200;
+
 function json(data: unknown, status = 200, requestId?: string): Response {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (requestId) headers["X-Request-Id"] = requestId;
@@ -407,6 +410,7 @@ export async function handleApi(req: Request, path: string, clientIp: string): P
       const voice = typeof body.voice === "string" ? body.voice : "";
       const text = sanitizeString(body.text || "");
       const language = body.language || "Auto";
+      const instruct = sanitizeString(body.instruct || "", MAX_INSTRUCT_LENGTH).trim();
       if (!voice || !text) {
         return errorResponse("BAD_REQUEST", "voice and text are required", requestId, 400);
       }
@@ -417,15 +421,32 @@ export async function handleApi(req: Request, path: string, clientIp: string): P
       } catch {
         return errorResponse("SERVICE_UNAVAILABLE", "TTS server is not available. Please wait for it to start.", requestId, 503);
       }
-      if (!voices.some((v) => v.id === voice)) {
+      const systemVoice = voices.find((v) => v.id === voice);
+      if (!systemVoice) {
         return errorResponse("BAD_REQUEST", `Unknown voice: ${voice}`, requestId, 400);
       }
+      if (instruct && !systemVoice.instruct) {
+        return errorResponse(
+          "BAD_REQUEST",
+          "The loaded CustomVoice model does not support style instructions (1.7B only)",
+          requestId,
+          400
+        );
+      }
 
-      const job = await createTtsJob(SYSTEM_PROFILE_ID, voice, text, language, { mode: "tts", voice });
-      log.info("TTS job created", { requestId, jobId: job.id, voice, textLength: text.length });
+      const job = await createTtsJob(SYSTEM_PROFILE_ID, voice, text, language, {
+        mode: "tts",
+        voice,
+        ...(instruct && { instruct }),
+      });
+      log.info("TTS job created", { requestId, jobId: job.id, voice, instruct, textLength: text.length });
 
       // Fire-and-forget: run streaming generation in background
-      runStreamingJob(job, requestTtsStream({ voice, text, language }, requestId), requestId);
+      runStreamingJob(
+        job,
+        requestTtsStream({ voice, text, language, ...(instruct && { instruct }) }, requestId),
+        requestId
+      );
 
       return json({ jobId: job.id }, 202, requestId);
     }

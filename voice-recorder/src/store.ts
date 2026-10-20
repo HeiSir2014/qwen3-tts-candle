@@ -271,6 +271,8 @@ export interface TtsJob {
   mode?: "single" | "dialog" | "tts";
   /** Preset speaker id for mode "tts" (profileId is SYSTEM_PROFILE_ID). */
   voice?: string;
+  /** Style instruction for a preset voice, e.g. "用特别愤怒的语气说". */
+  instruct?: string;
   dialogSegments?: DialogSegment[];
   profileIds?: string[];
   audioDurationS?: number;
@@ -308,6 +310,7 @@ export async function createTtsJob(
   options?: {
     mode?: TtsJob["mode"];
     voice?: string;
+    instruct?: string;
     dialogSegments?: DialogSegment[];
     profileIds?: string[];
   }
@@ -324,6 +327,7 @@ export async function createTtsJob(
       createdAt: new Date().toISOString(),
       ...(options?.mode && { mode: options.mode }),
       ...(options?.voice && { voice: options.voice }),
+      ...(options?.instruct && { instruct: options.instruct }),
       ...(options?.dialogSegments && { dialogSegments: options.dialogSegments }),
       ...(options?.profileIds && { profileIds: options.profileIds }),
     };

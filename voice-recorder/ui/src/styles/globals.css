@@ -781,6 +781,7 @@ body::before {
   margin-bottom: 6px;
 }
 
+.form-group input[type="text"],
 .form-group select,
 .form-group textarea {
   width: 100%;
@@ -810,6 +811,7 @@ body::before {
   color: var(--color-foreground);
 }
 
+.form-group input[type="text"]:focus,
 .form-group select:focus,
 .form-group textarea:focus {
   border-color: var(--color-active);
@@ -1392,6 +1394,7 @@ body::before {
   .selected-script-text {
     font-size: 0.95rem;
   }
+  .form-group input[type="text"],
   .form-group select,
   .form-group textarea {
     font-size: 16px;

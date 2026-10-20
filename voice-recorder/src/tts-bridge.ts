@@ -123,6 +123,8 @@ export interface SystemVoice {
   id: string;
   name: string;
   description: string;
+  /** Whether the model follows a style instruction (1.7B CustomVoice only). */
+  instruct?: boolean;
 }
 
 /** Preset CustomVoice speakers; empty when the server has no CustomVoice model. */
@@ -284,10 +286,15 @@ export function requestCloneStream(
 
 /** Preset-voice synthesis (CustomVoice model), same frame protocol as cloning. */
 export function requestTtsStream(
-  body: { voice: string; text: string; language: string },
+  body: { voice: string; text: string; language: string; instruct?: string },
   requestId?: string
 ): AsyncGenerator<CloneStreamChunk, void, undefined> {
-  log.info("tts_stream_start", { requestId, voice: body.voice, text_length: body.text.length });
+  log.info("tts_stream_start", {
+    requestId,
+    voice: body.voice,
+    text_length: body.text.length,
+    instruct: body.instruct,
+  });
   return requestFrameStream("/tts-stream", body, requestId);
 }
 
