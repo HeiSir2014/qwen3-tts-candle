@@ -23,6 +23,9 @@ pub struct AppState {
     pub model: StdMutex<Qwen3TTS>,
     /// Optional CustomVoice model serving the preset speakers.
     pub custom_voice: Option<StdMutex<Qwen3TTS>>,
+    /// Whether the CustomVoice model follows style instructions (1.7B only).
+    /// Cached so `/speakers` never waits on the model lock.
+    pub custom_voice_instruct: bool,
     /// Cache of pre-computed voice clone prompts, keyed by embedding file path.
     pub prompt_cache: TokioMutex<HashMap<String, SerializablePrompt>>,
     /// Number of requests currently waiting for the model lock.
@@ -81,6 +84,7 @@ impl AppState {
                     Ok(_) => tracing::info!("CustomVoice warmup complete"),
                     Err(e) => tracing::warn!("CustomVoice warmup failed (non-fatal): {}", e),
                 }
+                tracing::info!(instruct = cv.supports_instruct(), "CustomVoice model ready");
                 Some(StdMutex::new(cv))
             }
             None => None,
@@ -88,6 +92,9 @@ impl AppState {
 
         Ok(Self {
             model: StdMutex::new(model),
+            custom_voice_instruct: custom_voice
+                .as_ref()
+                .is_some_and(|cv| cv.lock().unwrap().supports_instruct()),
             custom_voice,
             prompt_cache: TokioMutex::new(HashMap::new()),
             queue_size: TokioMutex::new(0),

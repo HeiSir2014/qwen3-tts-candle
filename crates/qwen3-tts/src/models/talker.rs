@@ -570,18 +570,36 @@ impl TalkerModel {
     /// ("non-streaming text input", the default of the official
     /// `generate_custom_voice` and of mlx-audio).
     ///
-    /// Same speaker/language prefix as [`Self::prefill_custom_voice`] up to
-    /// `tts_bos + codec_pad`, followed by every text token and `tts_eos`, each
-    /// added to `codec_pad`, and finally `tts_pad + codec_bos`. Generation
-    /// then adds only `tts_pad` (no trailing text). Dialect speakers get
-    /// their dialect language id for Chinese.
+    /// Runs [`Self::custom_voice_embeds`] through all layers. Generation then
+    /// adds only `tts_pad` (no trailing text).
     pub fn prefill_custom_voice_non_streaming(
         &self,
         text_tokens: &[u32],
+        instruct_tokens: &[u32],
         speaker: Speaker,
         language: Language,
         kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.custom_voice_embeds(text_tokens, instruct_tokens, speaker, language)?;
+        self.run_prefill_layers(hidden, kv_caches)
+    }
+
+    /// CustomVoice prompt, as built by the official `generate_custom_voice`:
+    /// - optional style instruction: `text_proj(<|im_start|>user\n{instruct}<|im_end|>\n)`
+    ///   (empty `instruct_tokens` means none)
+    /// - the speaker/language prefix of [`Self::prefill_custom_voice`] up to
+    ///   `tts_bos + codec_pad`
+    /// - every text token, then `tts_eos`, each + `codec_pad`
+    /// - `tts_pad + codec_bos`
+    ///
+    /// Dialect speakers get their dialect language id for Chinese.
+    pub fn custom_voice_embeds(
+        &self,
+        text_tokens: &[u32],
+        instruct_tokens: &[u32],
+        speaker: Speaker,
+        language: Language,
+    ) -> Result<Tensor> {
         use codec_tokens::*;
 
         let speaker_embed = self.get_codec_embedding(speaker.token_id())?;
@@ -598,8 +616,12 @@ impl TalkerModel {
         let text = text.broadcast_add(&self.get_codec_embedding(CODEC_PAD)?)?;
         let start = self.get_tts_pad_embed()?.add(&codec_bos_embed)?;
 
-        let hidden = Tensor::cat(&[&prefix, &text, &start], 1)?;
-        self.run_prefill_layers(hidden, kv_caches)
+        let mut parts = Vec::with_capacity(4);
+        if !instruct_tokens.is_empty() {
+            parts.push(self.get_projected_text_embeddings(instruct_tokens)?);
+        }
+        parts.extend([prefix, text, start]);
+        Ok(Tensor::cat(&parts, 1)?)
     }
 
     /// Role prefix plus `[tts_pad × 5, tts_bos]` overlaid on
@@ -1128,6 +1150,38 @@ mod tests {
             .prefill_voice_design(&text, &instruct, Language::English, &mut kv_caches)
             .unwrap();
         assert_eq!(hidden.dim(1).unwrap(), embeds.dim(1).unwrap());
+        assert_eq!(logits.dims(), &[1, 1, 3072]);
+    }
+
+    #[test]
+    fn test_custom_voice_instruct_goes_first() {
+        let talker = tiny_talker();
+        let (text, instruct) = ([11u32, 12, 13], [21u32, 22]);
+        let plain = talker
+            .custom_voice_embeds(&text, &[], Speaker::Ryan, Language::English)
+            .unwrap();
+        let styled = talker
+            .custom_voice_embeds(&text, &instruct, Speaker::Ryan, Language::English)
+            .unwrap();
+
+        assert_eq!(styled.dim(1).unwrap(), plain.dim(1).unwrap() + instruct.len());
+        let expected_instruct = talker.get_projected_text_embeddings(&instruct).unwrap();
+        let actual_instruct = styled.narrow(1, 0, instruct.len()).unwrap();
+        assert!(max_abs_diff(&expected_instruct, &actual_instruct) < 1e-6);
+        let rest = styled.narrow(1, instruct.len(), plain.dim(1).unwrap()).unwrap();
+        assert!(max_abs_diff(&plain, &rest) < 1e-6);
+
+        let mut kv_caches = talker.new_kv_caches(64);
+        let (hidden, logits) = talker
+            .prefill_custom_voice_non_streaming(
+                &text,
+                &instruct,
+                Speaker::Ryan,
+                Language::English,
+                &mut kv_caches,
+            )
+            .unwrap();
+        assert_eq!(hidden.dim(1).unwrap(), styled.dim(1).unwrap());
         assert_eq!(logits.dims(), &[1, 1, 3072]);
     }
 

@@ -297,6 +297,8 @@ pub struct SpeakerInfo {
     pub id: &'static str,
     pub name: &'static str,
     pub description: &'static str,
+    /// Whether `/tts-stream` honors `instruct` for this speaker.
+    pub instruct: bool,
 }
 
 pub async fn speakers(State(state): State<Arc<AppState>>) -> Json<Vec<SpeakerInfo>> {
@@ -310,6 +312,7 @@ pub async fn speakers(State(state): State<Arc<AppState>>) -> Json<Vec<SpeakerInf
                 id,
                 name,
                 description,
+                instruct: state.custom_voice_instruct,
             })
             .collect(),
     )
@@ -322,6 +325,8 @@ pub struct TtsStreamRequest {
     pub voice: String,
     pub text: String,
     pub language: Option<String>,
+    /// Style instruction, e.g. "用特别愤怒的语气说" (1.7B CustomVoice only).
+    pub instruct: Option<String>,
 }
 
 pub async fn tts_stream(
@@ -335,6 +340,7 @@ pub async fn tts_stream(
         request_id = %rid,
         voice = %req.voice,
         text_len = req.text.len(),
+        instruct = ?req.instruct,
         "tts_stream_start"
     );
 
@@ -361,13 +367,22 @@ pub async fn tts_stream(
     };
 
     let text = req.text;
+    let instruct = req.instruct.unwrap_or_default();
     stream_response(
         state,
         rid,
         start,
         "tts_stream",
         ModelKind::CustomVoice,
-        move |model| model.synthesize_streaming(&text, speaker, language, sampling_options()),
+        move |model| {
+            model.synthesize_streaming_with_instruct(
+                &text,
+                speaker,
+                language,
+                &instruct,
+                sampling_options(),
+            )
+        },
     )
 }
 
