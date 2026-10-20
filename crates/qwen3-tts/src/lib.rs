@@ -1735,16 +1735,15 @@ impl<'a> StreamingSession<'a> {
             model.build_trailing_text(&input_ids)?;
 
         let mut kv_caches = model.talker.new_kv_caches(gen_config.max_new_tokens + 256);
-        let prefill_result = model
+        let prefix = model
             .talker
-            .prefill_voice_clone(&input_ids, &speaker_embed, language, is_icl, &mut kv_caches)?;
+            .voice_clone_prefix(&input_ids, &speaker_embed, language, is_icl)?;
 
-        // Start from the basic prefill result; ICL will override these if active.
-        let (mut offset, mut last_hidden, mut logits) = Self::unpack_prefill(&prefill_result)?;
-
-        // ICL extension if needed — mirrors synthesize_voice_clone_debug logic
+        // ICL: the reference prompt follows the prefix and both are prefilled
+        // in one pass (same result as two passes, one fewer trip through the
+        // 28 talker layers before the first token).
         let mut decoder_state = DecoderStreamState::default();
-        let trailing_text_hidden = if let (Some(ref_codes), Some(ref_text_ids)) =
+        let (prefill_input, trailing_text_hidden) = if let (Some(ref_codes), Some(ref_text_ids)) =
             (&prompt.ref_codes, &prompt.ref_text_ids)
         {
             let ref_codec_embeds = model.sum_ref_codec_embeddings(ref_codes)?;
@@ -1752,45 +1751,23 @@ impl<'a> StreamingSession<'a> {
                 .talker
                 .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, false)?;
 
-            let icl_len = icl_embed.dim(1)?;
-            if icl_len > 0 {
-                let mask =
-                    models::transformer::create_causal_mask(icl_len, offset, &model.device)?;
+            // Give the codec decoder's transformer the reference frames as
+            // context (the reference implementation decodes ref + generated
+            // codes together). Only the frame-rate part runs, so this costs
+            // a few ms instead of decoding the reference audio.
+            let ref_codes = ref_codes.t()?.unsqueeze(0)?.to_dtype(DType::I64)?;
+            model
+                .decoder
+                .prime_with_state(&ref_codes, &mut decoder_state)?;
 
-                let mut icl_hidden = icl_embed;
-                for (i, layer) in model.talker.layers_iter().enumerate() {
-                    icl_hidden = layer.forward(
-                        &icl_hidden,
-                        model.talker.rope(),
-                        Some(&mask),
-                        Some(&mut kv_caches[i]),
-                        offset,
-                    )?;
-                }
-                icl_hidden = model.talker.apply_norm(&icl_hidden)?;
-                offset += icl_len;
-
-                // Update last_hidden and logits so from_prefill sees ICL context
-                let last_icl_hidden = icl_hidden.i((.., icl_len - 1..icl_len, ..))?;
-                logits = model.talker.apply_codec_head(&last_icl_hidden)?;
-                last_hidden = last_icl_hidden;
-
-                // Give the codec decoder's transformer the reference frames as
-                // context (the reference implementation decodes ref + generated
-                // codes together). Only the frame-rate part runs, so this costs
-                // a few ms instead of decoding the reference audio.
-                let ref_codes = ref_codes.t()?.unsqueeze(0)?.to_dtype(DType::I64)?;
-                model
-                    .decoder
-                    .prime_with_state(&ref_codes, &mut decoder_state)?;
-
-                icl_trailing
-            } else {
-                trailing_text_hidden
-            }
+            (Tensor::cat(&[&prefix, &icl_embed], 1)?, icl_trailing)
         } else {
-            trailing_text_hidden
+            (prefix, trailing_text_hidden)
         };
+        let prefill_result = model
+            .talker
+            .run_prefill_layers(prefill_input, &mut kv_caches)?;
+        let (offset, last_hidden, logits) = Self::unpack_prefill(&prefill_result)?;
 
         // Recompute trailing_text_len from the (possibly ICL-replaced) tensor,
         // matching synthesize_voice_clone_debug which computes it after the ICL block.

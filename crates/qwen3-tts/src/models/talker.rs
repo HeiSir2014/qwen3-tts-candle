@@ -519,6 +519,20 @@ impl TalkerModel {
         icl_mode: bool,
         kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.voice_clone_prefix(text_tokens, speaker_embed, language, icl_mode)?;
+        self.run_prefill_layers(hidden, kv_caches)
+    }
+
+    /// Input embeddings of [`Self::prefill_voice_clone`], `[1, 9 or 10, hidden]`,
+    /// without running the transformer (so an ICL prompt can be appended and
+    /// both prefilled in one pass with [`Self::run_prefill_layers`]).
+    pub fn voice_clone_prefix(
+        &self,
+        text_tokens: &[u32],
+        speaker_embed: &Tensor,
+        language: Language,
+        icl_mode: bool,
+    ) -> Result<Tensor> {
         use codec_tokens::*;
 
         let role_prefix_hidden = self.build_role_prefix()?;
@@ -563,7 +577,7 @@ impl TalkerModel {
             }
         }
 
-        self.run_prefill_layers(hidden, kv_caches)
+        Ok(hidden)
     }
 
     /// Prefill for VoiceDesign model with text-described voice conditioning.
@@ -823,7 +837,9 @@ impl TalkerModel {
     /// Run prefill through all layers: causal mask → layers → norm → logits.
     ///
     /// Returns `(hidden_states, logits)` for the full sequence.
-    fn run_prefill_layers(
+    /// Prefill input embeddings `[1, seq, hidden]` from position 0 through all
+    /// layers. Returns the normed hidden states and the last position's logits.
+    pub fn run_prefill_layers(
         &self,
         mut hidden: Tensor,
         kv_caches: &mut [AnyKVCache],
