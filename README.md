@@ -93,7 +93,7 @@ TTS_BACKEND=mlx            # or rust
 
 Measured on Apple Silicon (0.6B Base, ICL voice clone, streaming 0.8 s chunks,
 `cargo run --release --features metal,hub --example clone_stream_bench`):
-Candle 0.11 Metal BF16 RTF ≈ 0.58–0.64 (TTFB ≈ 0.64–0.67 s) vs mlx bf16
+Candle 0.11 Metal BF16 RTF ≈ 0.55–0.63 (TTFB ≈ 0.62–0.66 s) vs mlx bf16
 RTF ≈ 0.65–0.70 (TTFB ≈ 0.57–0.60 s). 4-bit MLX checkpoints are ~2x faster
 again but occasionally fail to emit EOS, so mlx-server caps generation length
 relative to the text.
