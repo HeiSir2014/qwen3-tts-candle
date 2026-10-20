@@ -15,13 +15,14 @@ use candle_nn::VarBuilder;
 /// Reference: "Neural Networks Fail to Learn Periodic Functions and How to Fix It"
 /// (<https://arxiv.org/abs/2006.08195>)
 pub struct SnakeBeta {
-    /// Learned frequency parameter (exponentiated before use)
+    /// `exp(alpha)`, shape `[channels]`
     alpha: Tensor,
-    /// Learned magnitude parameter (exponentiated before use)
-    beta: Tensor,
-    /// Small constant to prevent division by zero
-    epsilon: f64,
+    /// `1 / (exp(beta) + epsilon)`, shape `[channels]`
+    inv_beta: Tensor,
 }
+
+/// Small constant to prevent division by zero
+const EPSILON: f64 = 1e-9;
 
 impl SnakeBeta {
     /// Create a new SnakeBeta activation.
@@ -32,22 +33,17 @@ impl SnakeBeta {
     pub fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
         let alpha = vb.get((channels,), "alpha")?;
         let beta = vb.get((channels,), "beta")?;
-
-        Ok(Self {
-            alpha,
-            beta,
-            epsilon: 1e-9,
-        })
+        Self::from_weights(alpha, beta)
     }
 
     /// Create from raw weight tensors.
     ///
-    /// Alpha and beta should have shape `[channels]`.
+    /// Alpha and beta should have shape `[channels]`. The exponentiated
+    /// parameters are precomputed once here rather than on every call.
     pub fn from_weights(alpha: Tensor, beta: Tensor) -> Result<Self> {
         Ok(Self {
-            alpha,
-            beta,
-            epsilon: 1e-9,
+            alpha: alpha.exp()?,
+            inv_beta: (beta.exp()? + EPSILON)?.recip()?,
         })
     }
 
@@ -56,24 +52,23 @@ impl SnakeBeta {
     /// Input shape: [batch, channels, seq_len]
     /// Output shape: [batch, channels, seq_len]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Reshape alpha and beta for broadcasting: [channels] -> [1, channels, 1]
+        // On Metal one fused kernel replaces five full-size elementwise passes.
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() && x.dtype() == candle_core::DType::F32 {
+            return Ok(x.contiguous()?.apply_op3_no_bwd(
+                &self.alpha,
+                &self.inv_beta,
+                &crate::models::metal_ops::SnakeBetaOp,
+            )?);
+        }
+
+        // Reshape alpha and 1/beta for broadcasting: [channels] -> [1, channels, 1]
         let alpha = self.alpha.unsqueeze(0)?.unsqueeze(2)?;
-        let beta = self.beta.unsqueeze(0)?.unsqueeze(2)?;
-
-        // Exponentiate parameters
-        let alpha = alpha.exp()?;
-        let beta = beta.exp()?;
-
-        // Compute sin²(alpha * x)
-        let scaled_x = x.broadcast_mul(&alpha)?;
-        let sin_term = scaled_x.sin()?.sqr()?;
-
-        // Compute 1/(beta + epsilon)
-        let inv_beta = (beta + self.epsilon)?.recip()?;
+        let inv_beta = self.inv_beta.unsqueeze(0)?.unsqueeze(2)?;
 
         // x + (1/beta) * sin²(alpha * x)
-        let scaled_sin = sin_term.broadcast_mul(&inv_beta)?;
-        Ok((x + scaled_sin)?)
+        let sin_term = x.broadcast_mul(&alpha)?.sin()?.sqr()?;
+        Ok((x + sin_term.broadcast_mul(&inv_beta)?)?)
     }
 }
 
@@ -129,6 +124,46 @@ mod tests {
 
         // sin²(x) is always >= 0, so output >= input
         assert!(output_sum >= input_sum - 0.01);
+    }
+
+    /// The fused Metal kernel must match the tensor-op path on CPU.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_snake_beta_metal_matches_cpu() {
+        let Ok(metal) = Device::new_metal(0) else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let alpha = Tensor::randn(0.0f32, 0.5, (16,), &cpu).unwrap();
+        let beta = Tensor::randn(0.0f32, 0.5, (16,), &cpu).unwrap();
+        // Large inputs exercise sin range reduction.
+        let input = Tensor::randn(0.0f32, 20.0, (2, 16, 333), &cpu).unwrap();
+
+        let expected = SnakeBeta::from_weights(alpha.clone(), beta.clone())
+            .unwrap()
+            .forward(&input)
+            .unwrap();
+        let actual = SnakeBeta::from_weights(
+            alpha.to_device(&metal).unwrap(),
+            beta.to_device(&metal).unwrap(),
+        )
+        .unwrap()
+        .forward(&input.to_device(&metal).unwrap())
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap();
+
+        let diff: f32 = (&expected - &actual)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff < 1e-4, "metal vs cpu max diff {diff}");
     }
 
     #[test]

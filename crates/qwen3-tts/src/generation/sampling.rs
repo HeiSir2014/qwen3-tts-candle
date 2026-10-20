@@ -16,71 +16,48 @@ use candle_core::{DType, IndexOp, Tensor, D};
 /// When created with a seed, the same seed produces identical output
 /// across runs and threads. Without a seed, uses system entropy.
 pub struct SamplingContext {
-    /// PCG state (only used when seeded)
+    /// PCG state
     state: u64,
-    /// Whether we're in seeded mode
-    seeded: bool,
-    /// Counter for unseeded fallback
-    counter: u64,
+}
+
+/// Mix a seed with the PCG increment to avoid degenerate states.
+fn pcg_state(seed: u64) -> u64 {
+    seed.wrapping_mul(2685821657736338717)
+        .wrapping_add(1442695040888963407)
 }
 
 impl SamplingContext {
     /// Create a new sampling context with an optional seed.
     ///
     /// When `seed` is `Some`, all sampling is deterministic and reproducible.
-    /// When `None`, uses system time + counter for randomness.
+    /// When `None`, the generator is seeded from the system clock and a
+    /// process-wide counter (so contexts created together still differ).
     pub fn new(seed: Option<u64>) -> Self {
-        match seed {
-            Some(s) => {
-                // Mix seed with PCG increment to avoid degenerate states
-                let state = s
-                    .wrapping_mul(2685821657736338717)
-                    .wrapping_add(1442695040888963407);
-                Self {
-                    state,
-                    seeded: true,
-                    counter: 0,
-                }
-            }
-            None => Self {
-                state: 0,
-                seeded: false,
-                counter: 0,
-            },
-        }
-    }
-
-    /// Reset the RNG to its initial seeded state.
-    ///
-    /// Only meaningful for seeded contexts. For unseeded contexts, this is a no-op.
-    pub fn reset(&mut self, seed: u64) {
-        let state = seed
-            .wrapping_mul(2685821657736338717)
-            .wrapping_add(1442695040888963407);
-        self.state = state;
-        self.seeded = true;
-    }
-
-    /// Generate a random f32 in [0, 1).
-    fn rand_f32(&mut self) -> f32 {
-        if !self.seeded {
+        let seed = seed.unwrap_or_else(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
             use std::time::{SystemTime, UNIX_EPOCH};
-
-            let seed = SystemTime::now()
+            static CONTEXTS: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .subsec_nanos() as u64;
-            let count = self.counter;
-            self.counter += 1;
-
-            // LCG with seed and counter
-            let state = seed
-                .wrapping_add(count)
-                .wrapping_mul(1103515245)
-                .wrapping_add(12345);
-            return (state as f32) / (u64::MAX as f32);
+                .as_nanos() as u64;
+            nanos
+                ^ CONTEXTS
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        });
+        Self {
+            state: pcg_state(seed),
         }
+    }
 
+    /// Reset the RNG to the initial state for `seed`.
+    pub fn reset(&mut self, seed: u64) {
+        self.state = pcg_state(seed);
+    }
+
+    /// Generate a random f32 in [0, 1].
+    fn rand_f32(&mut self) -> f32 {
         // PCG XSH RR 64/32
         let old_state = self.state;
         self.state = old_state
@@ -374,6 +351,28 @@ fn top_p_filter(logits: &Tensor, p: f64) -> Result<Tensor> {
 /// Sample from probability distribution using multinomial sampling
 fn multinomial_sample(probs: &Tensor, ctx: &mut SamplingContext) -> Result<Tensor> {
     let (batch, vocab) = probs.dims2()?;
+
+    if probs.device().is_cpu() {
+        // CPU path: linear scan. candle's `cumsum` is a matmul with a
+        // [vocab, vocab] triangular matrix, which dominates sampling time.
+        let rows: Vec<Vec<f32>> = probs.to_vec2()?;
+        let tokens: Vec<u32> = rows
+            .iter()
+            .map(|row| {
+                let u = ctx.rand_f32();
+                let mut cumsum = 0.0f32;
+                row.iter()
+                    .position(|&p| {
+                        cumsum += p;
+                        cumsum >= u
+                    })
+                    // Rounding can leave the total just below `u`.
+                    .or_else(|| row.iter().rposition(|&p| p > 0.0))
+                    .unwrap_or(0) as u32
+            })
+            .collect();
+        return Ok(Tensor::new(tokens.as_slice(), probs.device())?);
+    }
 
     // Cumulative distribution for sampling
     let cumsum = probs.cumsum(1)?;
@@ -673,8 +672,19 @@ mod tests {
         }
     }
 
+    /// Unseeded draws must cover [0, 1] uniformly (they used to be confined
+    /// to ~[0, 0.06], making "random" sampling nearly greedy).
     #[test]
-    #[ignore = "flaky under parallel execution due to global RNG state"]
+    fn test_unseeded_rand_is_uniform() {
+        let mut ctx = SamplingContext::new(None);
+        let values: Vec<f32> = (0..10_000).map(|_| ctx.rand_f32()).collect();
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        let max = values.iter().cloned().fold(0f32, f32::max);
+        assert!((mean - 0.5).abs() < 0.02, "mean {mean}");
+        assert!(max > 0.99, "max {max}");
+    }
+
+    #[test]
     fn test_rand_f32_variability() {
         let mut ctx = SamplingContext::new(None);
         let values: Vec<f32> = (0..10).map(|_| ctx.rand_f32()).collect();

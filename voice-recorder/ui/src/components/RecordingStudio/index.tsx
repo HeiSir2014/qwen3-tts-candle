@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import type { Profile, Script } from "../../types";
 import { useI18n } from "../../i18n";
 import { useRecorder } from "../../hooks/useRecorder";
@@ -14,10 +14,20 @@ interface Props {
   onRefresh: () => Promise<void>;
 }
 
+const MAX_EMBEDDING_POLLS = 60; // 60 × 3s = 3 min max
+
 export function RecordingStudio({ profile, scripts, onRefresh }: Props) {
   const { t } = useI18n();
   const { showToast } = useToast();
   const recorder = useRecorder();
+  const embeddingPollRef = useRef<ReturnType<typeof setInterval>>(undefined);
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (embeddingPollRef.current) clearInterval(embeddingPollRef.current);
+    };
+  }, []);
 
   const [phase, setPhase] = useState<"select" | "record">("select");
   const [selectedScriptId, setSelectedScriptId] = useState<string | null>(null);
@@ -71,15 +81,20 @@ export function RecordingStudio({ profile, scripts, onRefresh }: Props) {
       await onRefresh();
 
       if (recording?.id) {
-        const poll = setInterval(async () => {
+        if (embeddingPollRef.current) clearInterval(embeddingPollRef.current);
+        let attempts = 0;
+        embeddingPollRef.current = setInterval(async () => {
+          attempts++;
           try {
             const res = await api.embeddingStatus(profile.id, recording.id);
-            if (res.status === "ready" || res.status === "failed") {
-              clearInterval(poll);
+            if (res.status === "ready" || res.status === "failed" || attempts >= MAX_EMBEDDING_POLLS) {
+              clearInterval(embeddingPollRef.current);
+              embeddingPollRef.current = undefined;
               await onRefresh();
             }
           } catch {
-            clearInterval(poll);
+            clearInterval(embeddingPollRef.current);
+            embeddingPollRef.current = undefined;
           }
         }, 3000);
       }
@@ -118,15 +133,20 @@ export function RecordingStudio({ profile, scripts, onRefresh }: Props) {
   const retryEmbedding = useCallback(
     async (profileId: string, recordingId: string) => {
       await api.retryEmbedding(profileId, recordingId);
-      const poll = setInterval(async () => {
+      if (embeddingPollRef.current) clearInterval(embeddingPollRef.current);
+      let attempts = 0;
+      embeddingPollRef.current = setInterval(async () => {
+        attempts++;
         try {
           const res = await api.embeddingStatus(profileId, recordingId);
-          if (res.status === "ready" || res.status === "failed") {
-            clearInterval(poll);
+          if (res.status === "ready" || res.status === "failed" || attempts >= MAX_EMBEDDING_POLLS) {
+            clearInterval(embeddingPollRef.current);
+            embeddingPollRef.current = undefined;
             await onRefresh();
           }
         } catch {
-          clearInterval(poll);
+          clearInterval(embeddingPollRef.current);
+          embeddingPollRef.current = undefined;
         }
       }, 3000);
     },

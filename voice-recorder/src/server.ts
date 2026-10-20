@@ -1,8 +1,8 @@
 import { join } from "path";
 import { networkInterfaces } from "os";
 import { handleApi, triggerEmbeddingExtraction } from "./routes";
-import { startTtsServer, stopTtsServer } from "./rust-bridge";
-import { getProfiles, cleanupStaleJobs } from "./store";
+import { startTtsServer, stopTtsServer } from "./tts-bridge";
+import { getProfiles, cleanupStaleJobs, getEmbeddingPath } from "./store";
 import { createLogger } from "./logger";
 
 const log = createLogger("server");
@@ -90,7 +90,9 @@ cleanupStaleJobs().then((n) => {
   if (n > 0) log.info(`Cleaned up ${n} stale processing job(s) from previous run`);
 }).catch(() => {});
 
-// Start Rust TTS server in background, then process pending embeddings sequentially
+// Start TTS server in background, then process pending embeddings sequentially.
+// "ready" recordings are redone when the current backend's prompt file is
+// missing (e.g. after switching TTS_BACKEND), since the formats differ.
 startTtsServer()
   .then(async () => {
     try {
@@ -98,7 +100,9 @@ startTtsServer()
       const pending: { profileId: string; recordingId: string; scriptText: string }[] = [];
       for (const profile of profiles) {
         for (const recording of profile.recordings) {
-          if (recording.embeddingStatus === "pending" || recording.embeddingStatus === "processing") {
+          const missingPrompt = recording.embeddingStatus === "ready"
+            && !(await Bun.file(getEmbeddingPath(profile.id, recording.id)).exists());
+          if (recording.embeddingStatus === "pending" || recording.embeddingStatus === "processing" || missingPrompt) {
             pending.push({ profileId: profile.id, recordingId: recording.id, scriptText: recording.scriptText });
           }
         }
@@ -117,7 +121,7 @@ startTtsServer()
     }
   })
   .catch((err: any) => {
-    log.error("Failed to start Rust TTS server", { error: err.message });
+    log.error("Failed to start TTS server", { error: err.message });
     log.error("Voice clone features will not be available.");
   });
 

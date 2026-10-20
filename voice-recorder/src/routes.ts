@@ -19,11 +19,20 @@ import {
   saveTtsChunk,
   finalizeTtsChunks,
   buildChunkWav,
+  SYSTEM_PROFILE_ID,
   type TtsJob,
   type DialogSegment,
 } from "./store";
 import { SCRIPTS } from "./scripts";
-import { requestCloneStream, checkTtsHealth, requestExtractEmbedding } from "./rust-bridge";
+import {
+  requestCloneStream,
+  requestTtsStream,
+  checkTtsHealth,
+  requestExtractEmbedding,
+  fetchSystemVoices,
+  TTS_BACKEND,
+  type CloneStreamChunk,
+} from "./tts-bridge";
 import { emitJobEvent, onJobEvent, type JobEvent } from "./job-events";
 import { createLogger } from "./logger";
 import {
@@ -110,6 +119,109 @@ export async function triggerEmbeddingExtraction(profileId: string, recordingId:
   }
 }
 
+/**
+ * Drain a TTS frame stream into a persistent job: save chunks, emit progress
+ * events, then finalize the WAV. Runs fire-and-forget after the 202 response.
+ */
+async function runStreamingJob(
+  job: TtsJob,
+  stream: AsyncGenerator<CloneStreamChunk, void, undefined>,
+  requestId: string
+): Promise<void> {
+  const profileId = job.profileId;
+  const startTime = Date.now();
+  try {
+    let lastSampleRate = 24000;
+    let chunksReceived = 0;
+    let totalPcmBytes = 0;
+    let firstChunkTime: number | null = null;
+
+    for await (const chunk of stream) {
+      const now = Date.now();
+      if (firstChunkTime === null) {
+        firstChunkTime = now;
+        log.info("Clone first chunk received (TTFB)", {
+          jobId: job.id, requestId,
+          ttfbMs: now - startTime,
+          chunkIndex: chunk.chunkIndex,
+          pcmBytes: chunk.pcmData.byteLength,
+          sampleRate: chunk.sampleRate,
+        });
+      }
+
+      await saveTtsChunk(profileId, job.id, chunk.chunkIndex, chunk.pcmData);
+      chunksReceived = chunk.chunkIndex + 1;
+      totalPcmBytes += chunk.pcmData.byteLength;
+      // In true streaming mode totalChunks is 0xFFFFFFFE (unknown), pass 0 to indicate streaming
+      const reportTotal = chunk.totalChunks === 0xFFFFFFFE ? 0 : chunk.totalChunks;
+      await updateTtsJobProgress(job.id, chunksReceived, reportTotal);
+      lastSampleRate = chunk.sampleRate;
+
+      emitJobEvent({
+        type: "chunk_ready",
+        jobId: job.id,
+        data: { chunkIndex: chunk.chunkIndex, chunksCompleted: chunksReceived, chunksTotal: reportTotal },
+      });
+
+      log.info("Clone chunk saved", {
+        jobId: job.id, requestId,
+        chunkIndex: chunk.chunkIndex,
+        chunksReceived,
+        pcmBytes: chunk.pcmData.byteLength,
+        elapsedMs: now - startTime,
+      });
+    }
+
+    // Finalize: concatenate all chunks into a single WAV
+    if (chunksReceived > 0) {
+      const finalizeStart = Date.now();
+      await finalizeTtsChunks(profileId, job.id, chunksReceived, lastSampleRate);
+      log.info("Clone chunks finalized", {
+        jobId: job.id, requestId,
+        totalChunks: chunksReceived,
+        finalizeMs: Date.now() - finalizeStart,
+      });
+    }
+
+    const durationMs = Date.now() - startTime;
+    const estimatedAudioS = totalPcmBytes / (lastSampleRate * 2); // 16-bit mono
+    await completeTtsJob(job.id, null, durationMs, {
+      audioDurationS: Math.round(estimatedAudioS * 100) / 100,
+    });
+
+    emitJobEvent({
+      type: "completed",
+      jobId: job.id,
+      data: { durationMs, chunksTotal: chunksReceived },
+    });
+
+    log.info("Clone job completed", {
+      jobId: job.id, requestId,
+      durationMs,
+      totalChunks: chunksReceived,
+      totalPcmBytes,
+      estimatedAudioS: Math.round(estimatedAudioS * 100) / 100,
+      ttfbMs: firstChunkTime ? firstChunkTime - startTime : null,
+    });
+  } catch (err: any) {
+    const durationMs = Date.now() - startTime;
+    await failTtsJob(job.id, err.message);
+
+    emitJobEvent({
+      type: "failed",
+      jobId: job.id,
+      data: { error: err.message },
+    });
+
+    log.error("Clone job failed", {
+      jobId: job.id, requestId,
+      error: err.message,
+      durationMs,
+      chunksReceived: 0,
+    });
+  }
+}
+
 export async function handleApi(req: Request, path: string, clientIp: string): Promise<Response | null> {
   const requestId = generateRequestId();
   const logEnd = logRequest(requestId, req.method, path, clientIp);
@@ -118,7 +230,7 @@ export async function handleApi(req: Request, path: string, clientIp: string): P
   try {
     // Rate limiting — only for write operations (POST/DELETE), not GET reads
     if (method !== "GET") {
-      const isClone = path === "/api/clone" || path === "/api/clone-dialog";
+      const isClone = path === "/api/clone" || path === "/api/clone-dialog" || path === "/api/tts";
       const rl = checkRateLimit(clientIp, isClone);
       if (!rl.allowed) {
         const retrySeconds = Math.ceil((rl.retryAfterMs || 60000) / 1000);
@@ -256,114 +368,64 @@ export async function handleApi(req: Request, path: string, clientIp: string): P
 
       log.info("Clone job created", { requestId, jobId: job.id, profileId });
 
+      log.info("Clone stream iteration starting", {
+        jobId: job.id, requestId, profileId,
+        hasEmbedding, textLength: text.length,
+      });
+
       // Fire-and-forget: run streaming generation in background
-      const startTime = Date.now();
-      (async () => {
-        try {
-          let lastSampleRate = 24000;
-          let chunksReceived = 0;
-          let totalPcmBytes = 0;
-          let firstChunkTime: number | null = null;
+      runStreamingJob(
+        job,
+        requestCloneStream(
+          {
+            ref_audio_path: refAudioPath,
+            ref_text: refText,
+            text,
+            language: language || "Auto",
+            ...(hasEmbedding ? { embedding_path: embeddingPath } : {}),
+          },
+          requestId
+        ),
+        requestId
+      );
 
-          log.info("Clone stream iteration starting", {
-            jobId: job.id, requestId, profileId,
-            hasEmbedding, textLength: text.length,
-          });
+      return json({ jobId: job.id }, 202, requestId);
+    }
 
-          for await (const chunk of requestCloneStream(
-            {
-              ref_audio_path: refAudioPath,
-              ref_text: refText,
-              text,
-              language: language || "Auto",
-              ...(hasEmbedding ? { embedding_path: embeddingPath } : {}),
-            },
-            requestId
-          )) {
-            const now = Date.now();
-            if (firstChunkTime === null) {
-              firstChunkTime = now;
-              log.info("Clone first chunk received (TTFB)", {
-                jobId: job.id, requestId,
-                ttfbMs: now - startTime,
-                chunkIndex: chunk.chunkIndex,
-                pcmBytes: chunk.pcmData.byteLength,
-                sampleRate: chunk.sampleRate,
-              });
-            }
+    // GET /api/system-profiles — preset voices of the CustomVoice model
+    if (method === "GET" && path === "/api/system-profiles") {
+      try {
+        return json(await fetchSystemVoices(), 200, requestId);
+      } catch (err: any) {
+        return errorResponse("SERVICE_UNAVAILABLE", `TTS server is not available: ${err.message}`, requestId, 503);
+      }
+    }
 
-            await saveTtsChunk(profileId, job.id, chunk.chunkIndex, chunk.pcmData);
-            chunksReceived = chunk.chunkIndex + 1;
-            totalPcmBytes += chunk.pcmData.byteLength;
-            // In true streaming mode totalChunks is 0xFFFFFFFE (unknown), pass 0 to indicate streaming
-            const reportTotal = chunk.totalChunks === 0xFFFFFFFE ? 0 : chunk.totalChunks;
-            await updateTtsJobProgress(job.id, chunksReceived, reportTotal);
-            lastSampleRate = chunk.sampleRate;
+    // POST /api/tts — preset-voice synthesis, same async job flow as /api/clone
+    if (method === "POST" && path === "/api/tts") {
+      const body = await req.json();
+      const voice = typeof body.voice === "string" ? body.voice : "";
+      const text = sanitizeString(body.text || "");
+      const language = body.language || "Auto";
+      if (!voice || !text) {
+        return errorResponse("BAD_REQUEST", "voice and text are required", requestId, 400);
+      }
 
-            emitJobEvent({
-              type: "chunk_ready",
-              jobId: job.id,
-              data: { chunkIndex: chunk.chunkIndex, chunksCompleted: chunksReceived, chunksTotal: reportTotal },
-            });
+      let voices;
+      try {
+        voices = await fetchSystemVoices();
+      } catch {
+        return errorResponse("SERVICE_UNAVAILABLE", "TTS server is not available. Please wait for it to start.", requestId, 503);
+      }
+      if (!voices.some((v) => v.id === voice)) {
+        return errorResponse("BAD_REQUEST", `Unknown voice: ${voice}`, requestId, 400);
+      }
 
-            log.info("Clone chunk saved", {
-              jobId: job.id, requestId,
-              chunkIndex: chunk.chunkIndex,
-              chunksReceived,
-              pcmBytes: chunk.pcmData.byteLength,
-              elapsedMs: now - startTime,
-            });
-          }
+      const job = await createTtsJob(SYSTEM_PROFILE_ID, voice, text, language, { mode: "tts", voice });
+      log.info("TTS job created", { requestId, jobId: job.id, voice, textLength: text.length });
 
-          // Finalize: concatenate all chunks into a single WAV
-          if (chunksReceived > 0) {
-            const finalizeStart = Date.now();
-            await finalizeTtsChunks(profileId, job.id, chunksReceived, lastSampleRate);
-            log.info("Clone chunks finalized", {
-              jobId: job.id, requestId,
-              totalChunks: chunksReceived,
-              finalizeMs: Date.now() - finalizeStart,
-            });
-          }
-
-          const durationMs = Date.now() - startTime;
-          const estimatedAudioS = totalPcmBytes / (lastSampleRate * 2); // 16-bit mono
-          await completeTtsJob(job.id, null, durationMs, {
-            audioDurationS: Math.round(estimatedAudioS * 100) / 100,
-          });
-
-          emitJobEvent({
-            type: "completed",
-            jobId: job.id,
-            data: { durationMs, chunksTotal: chunksReceived },
-          });
-
-          log.info("Clone job completed", {
-            jobId: job.id, requestId,
-            durationMs,
-            totalChunks: chunksReceived,
-            totalPcmBytes,
-            estimatedAudioS: Math.round(estimatedAudioS * 100) / 100,
-            ttfbMs: firstChunkTime ? firstChunkTime - startTime : null,
-          });
-        } catch (err: any) {
-          const durationMs = Date.now() - startTime;
-          await failTtsJob(job.id, err.message);
-
-          emitJobEvent({
-            type: "failed",
-            jobId: job.id,
-            data: { error: err.message },
-          });
-
-          log.error("Clone job failed", {
-            jobId: job.id, requestId,
-            error: err.message,
-            durationMs,
-            chunksReceived: 0,
-          });
-        }
-      })();
+      // Fire-and-forget: run streaming generation in background
+      runStreamingJob(job, requestTtsStream({ voice, text, language }, requestId), requestId);
 
       return json({ jobId: job.id }, 202, requestId);
     }
@@ -732,7 +794,7 @@ export async function handleApi(req: Request, path: string, clientIp: string): P
           timestamp: new Date().toISOString(),
           services: {
             bun: { status: "ok", uptime_s: Math.floor(process.uptime()) },
-            rust_tts: { status: ttsHealthy ? "ok" : "unavailable" },
+            tts: { backend: TTS_BACKEND, status: ttsHealthy ? "ok" : "unavailable" },
           },
         },
         200,

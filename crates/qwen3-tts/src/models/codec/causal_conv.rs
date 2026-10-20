@@ -15,7 +15,14 @@ pub struct CausalConv1d {
     conv: Conv1d,
     /// Left padding to add before convolution
     causal_padding: usize,
+    /// For ungrouped convs: weight as `[out, kernel * in + 1]` (tap-major,
+    /// bias as last column) for [`conv1d_stacked_taps`].
+    gemm_weight: Option<Tensor>,
 }
+
+/// Left context carried between streaming calls of a [`CausalConv1d`]: the
+/// last `causal_padding` input samples. `None` means zeros (stream start).
+pub type CausalConvState = Option<Tensor>;
 
 impl CausalConv1d {
     /// Create a new causal conv1d layer.
@@ -43,12 +50,7 @@ impl CausalConv1d {
         };
 
         let conv = conv1d(in_channels, out_channels, kernel_size, config, vb)?;
-        let causal_padding = dilation * (kernel_size - 1);
-
-        Ok(Self {
-            conv,
-            causal_padding,
-        })
+        Self::from_conv(conv)
     }
 
     /// Create from raw weight and bias tensors.
@@ -68,9 +70,6 @@ impl CausalConv1d {
         dilation: usize,
         groups: usize,
     ) -> Result<Self> {
-        let kernel_size = weight.dim(2)?;
-        let causal_padding = dilation * (kernel_size - 1);
-
         let config = Conv1dConfig {
             padding: 0,
             stride: 1,
@@ -80,10 +79,21 @@ impl CausalConv1d {
         };
 
         let conv = Conv1d::new(weight, bias, config);
+        Self::from_conv(conv)
+    }
 
+    fn from_conv(conv: Conv1d) -> Result<Self> {
+        let kernel_size = conv.weight().dim(2)?;
+        let causal_padding = conv.config().dilation * (kernel_size - 1);
+        let gemm_weight = if conv.config().groups == 1 {
+            Some(tap_major_weight(conv.weight(), conv.bias())?)
+        } else {
+            None
+        };
         Ok(Self {
             conv,
             causal_padding,
+            gemm_weight,
         })
     }
 
@@ -92,15 +102,138 @@ impl CausalConv1d {
     /// Input shape: [batch, in_channels, seq_len]
     /// Output shape: [batch, out_channels, seq_len]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Pad only on the left side for causality
-        let x_padded = if self.causal_padding > 0 {
-            x.pad_with_zeros(2, self.causal_padding, 0)?
+        self.forward_with_state(x, &mut None)
+    }
+
+    /// Streaming forward: uses `state` as left context instead of zeros and
+    /// replaces it with the tail of this call's input, so feeding a sequence
+    /// in chunks gives the same output as one [`Self::forward`] call.
+    pub fn forward_with_state(&self, x: &Tensor, state: &mut CausalConvState) -> Result<Tensor> {
+        let pad = self.causal_padding;
+        if pad == 0 {
+            return self.conv1d(x);
+        }
+        let x_padded = match state.take() {
+            Some(prev) => Tensor::cat(&[&prev, x], 2)?,
+            None => x.pad_with_zeros(2, pad, 0)?,
+        };
+        let len = x_padded.dim(2)?;
+        *state = Some(x_padded.narrow(2, len - pad, pad)?.contiguous()?);
+        self.conv1d(&x_padded)
+    }
+
+    /// Unpadded convolution.
+    ///
+    /// Ungrouped convs stack the `kernel` shifted input views along channels
+    /// and run one matmul that writes `[batch, out, time]` directly; candle's
+    /// conv1d goes through im2col in time-major layout plus an output
+    /// transpose, which is several times slower on Metal. Depthwise convs are
+    /// a sum of per-tap scaled shifts, since candle runs grouped convs as one
+    /// conv per group, i.e. thousands of tiny kernels for a 1024-channel
+    /// depthwise conv.
+    fn conv1d(&self, x: &Tensor) -> Result<Tensor> {
+        let config = self.conv.config();
+        let weight = self.conv.weight();
+        let (c_out, c_in_per_group, k) = weight.dims3()?;
+        if let Some(gemm_weight) = &self.gemm_weight {
+            return conv1d_stacked_taps(x, gemm_weight, k, 1, config.dilation);
+        }
+        if c_in_per_group != 1 || c_out != config.groups {
+            return Ok(self.conv.forward(x)?);
+        }
+        let out_len = x.dim(2)? - config.dilation * (k - 1);
+        let weight = weight.reshape((1, c_out, k))?;
+        let mut y = match self.conv.bias() {
+            Some(bias) => x
+                .narrow(2, 0, out_len)?
+                .broadcast_mul(&weight.narrow(2, 0, 1)?)?
+                .broadcast_add(&bias.reshape((1, c_out, 1))?)?,
+            None => x
+                .narrow(2, 0, out_len)?
+                .broadcast_mul(&weight.narrow(2, 0, 1)?)?,
+        };
+        for tap in 1..k {
+            let shifted = x.narrow(2, tap * config.dilation, out_len)?;
+            y = (y + shifted.broadcast_mul(&weight.narrow(2, tap, 1)?)?)?;
+        }
+        Ok(y)
+    }
+}
+
+/// Rearrange a `[out, in, kernel]` conv weight to `[out, kernel * in]`
+/// (tap-major) for [`conv1d_stacked_taps`], with the bias appended as an
+/// extra last column.
+pub(crate) fn tap_major_weight(weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let (c_out, c_in, kernel_size) = weight.dims3()?;
+    let weight = weight
+        .permute((0, 2, 1))?
+        .contiguous()?
+        .reshape((c_out, kernel_size * c_in))?;
+    Ok(match bias {
+        Some(bias) => Tensor::cat(&[&weight, &bias.reshape((c_out, 1))?], 1)?,
+        None => weight,
+    })
+}
+
+/// Unpadded, ungrouped conv1d of `x` (`[batch, in, len]`) as one matmul: the
+/// `kernel_size` shifted (and, for `stride > 1`, decimated) input views are
+/// stacked along channels and multiplied by the tap-major weight from
+/// [`tap_major_weight`], writing `[batch, out, out_len]` directly. A bias
+/// column is applied through an extra row of ones.
+///
+/// candle's conv1d materialises im2col in time-major layout and transposes
+/// the output back, and a per-channel broadcast bias add costs ~3x a plain
+/// add on Metal; both are avoided here.
+pub(crate) fn conv1d_stacked_taps(
+    x: &Tensor,
+    gemm_weight: &Tensor,
+    kernel_size: usize,
+    stride: usize,
+    dilation: usize,
+) -> Result<Tensor> {
+    let (batch, channels, len) = x.dims3()?;
+    let out_len = (len - dilation * (kernel_size - 1) - 1) / stride + 1;
+    let has_bias = gemm_weight.dim(1)? == kernel_size * channels + 1;
+    let ones = || Tensor::ones((batch, 1, out_len), x.dtype(), x.device());
+    let cols = if kernel_size == 1 && stride == 1 {
+        if has_bias {
+            Tensor::cat(&[x, &ones()?], 1)?
         } else {
             x.clone()
+        }
+    } else if stride == 1 {
+        let mut taps = (0..kernel_size)
+            .map(|tap| x.narrow(2, tap * dilation, out_len))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        if has_bias {
+            taps.push(ones()?);
+        }
+        Tensor::cat(&taps, 1)?
+    } else {
+        anyhow::ensure!(dilation == 1, "strided conv1d requires dilation 1");
+        // View time as [frames, stride] so tap j = (j / stride) frames plus
+        // phase j % stride: x[t * stride + j] = frames[t + j / stride][j % stride].
+        let frames = out_len + (kernel_size - 1) / stride;
+        let needed = frames * stride;
+        let x = if len >= needed {
+            x.narrow(2, 0, needed)?.contiguous()?
+        } else {
+            x.pad_with_zeros(2, 0, needed - len)?
         };
-
-        Ok(self.conv.forward(&x_padded)?)
-    }
+        let x = x.reshape((batch, channels, frames, stride))?;
+        let mut taps = (0..kernel_size)
+            .map(|tap| {
+                x.narrow(2, tap / stride, out_len)?
+                    .narrow(3, tap % stride, 1)?
+                    .squeeze(3)
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        if has_bias {
+            taps.push(ones()?);
+        }
+        Tensor::cat(&taps, 1)?
+    };
+    Ok(gemm_weight.broadcast_matmul(&cols)?)
 }
 
 impl Module for CausalConv1d {
@@ -187,6 +320,123 @@ mod tests {
         let output = conv.forward(&input).unwrap();
 
         assert_eq!(output.dims(), &[1, 8, 10]);
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_causal_conv_streaming_matches_full() {
+        let device = Device::Cpu;
+        let weight = Tensor::randn(0.0f32, 1.0, (6, 4, 7), &device).unwrap();
+        let bias = Tensor::randn(0.0f32, 1.0, (6,), &device).unwrap();
+        let conv = CausalConv1d::from_weights(weight, Some(bias), 3).unwrap();
+
+        let input = Tensor::randn(0.0f32, 1.0, (1, 4, 23), &device).unwrap();
+        let full = conv.forward(&input).unwrap();
+
+        let mut state = None;
+        let chunks: Vec<Tensor> = [(0, 5), (5, 1), (6, 17)]
+            .iter()
+            .map(|&(start, len)| {
+                conv.forward_with_state(&input.narrow(2, start, len).unwrap(), &mut state)
+                    .unwrap()
+            })
+            .collect();
+        let streamed = Tensor::cat(&chunks, 2).unwrap();
+        assert!(max_abs_diff(&full, &streamed) < 1e-4);
+    }
+
+    #[test]
+    fn test_dilated_conv_matches_conv1d() {
+        let device = Device::Cpu;
+        let weight = Tensor::randn(0.0f32, 1.0, (6, 4, 7), &device).unwrap();
+        let bias = Tensor::randn(0.0f32, 1.0, (6,), &device).unwrap();
+        let conv = CausalConv1d::from_weights(weight.clone(), Some(bias.clone()), 3).unwrap();
+
+        let input = Tensor::randn(0.0f32, 1.0, (1, 4, 30), &device).unwrap();
+        let reference = Conv1d::new(
+            weight,
+            Some(bias),
+            Conv1dConfig {
+                dilation: 3,
+                ..Default::default()
+            },
+        )
+        .forward(&input.pad_with_zeros(2, 18, 0).unwrap())
+        .unwrap();
+        assert!(max_abs_diff(&conv.forward(&input).unwrap(), &reference) < 1e-4);
+    }
+
+    #[test]
+    fn test_strided_stacked_taps_matches_conv1d() {
+        let device = Device::Cpu;
+        for (k, stride, len) in [(8, 4, 37), (10, 5, 40), (3, 2, 11)] {
+            let weight = Tensor::randn(0.0f32, 1.0, (6, 4, k), &device).unwrap();
+            let bias = Tensor::randn(0.0f32, 1.0, (6,), &device).unwrap();
+            let input = Tensor::randn(0.0f32, 1.0, (1, 4, len), &device).unwrap();
+            let reference = Conv1d::new(
+                weight.clone(),
+                Some(bias.clone()),
+                Conv1dConfig {
+                    stride,
+                    ..Default::default()
+                },
+            )
+            .forward(&input)
+            .unwrap();
+            let gemm_weight = tap_major_weight(&weight, Some(&bias)).unwrap();
+            let out = conv1d_stacked_taps(&input, &gemm_weight, k, stride, 1).unwrap();
+            assert_eq!(out.dims(), reference.dims());
+            assert!(max_abs_diff(&out, &reference) < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_pointwise_conv_matches_conv1d() {
+        let device = Device::Cpu;
+        let weight = Tensor::randn(0.0f32, 1.0, (6, 4, 1), &device).unwrap();
+        let bias = Tensor::randn(0.0f32, 1.0, (6,), &device).unwrap();
+        let conv = CausalConv1d::from_weights(weight.clone(), Some(bias.clone()), 1).unwrap();
+
+        let input = Tensor::randn(0.0f32, 1.0, (2, 4, 9), &device).unwrap();
+        let reference = Conv1d::new(weight, Some(bias), Conv1dConfig::default())
+            .forward(&input)
+            .unwrap();
+        assert!(max_abs_diff(&conv.forward(&input).unwrap(), &reference) < 1e-4);
+    }
+
+    #[test]
+    fn test_depthwise_conv_matches_grouped_conv() {
+        let device = Device::Cpu;
+        let dim = 8;
+        let weight = Tensor::randn(0.0f32, 1.0, (dim, 1, 7), &device).unwrap();
+        let bias = Tensor::randn(0.0f32, 1.0, (dim,), &device).unwrap();
+        let conv =
+            CausalConv1d::from_weights_grouped(weight.clone(), Some(bias.clone()), 1, dim).unwrap();
+
+        let input = Tensor::randn(0.0f32, 1.0, (1, dim, 12), &device).unwrap();
+        let reference = Conv1d::new(
+            weight,
+            Some(bias),
+            Conv1dConfig {
+                groups: dim,
+                ..Default::default()
+            },
+        )
+        .forward(&input.pad_with_zeros(2, 6, 0).unwrap())
+        .unwrap();
+        assert!(max_abs_diff(&conv.forward(&input).unwrap(), &reference) < 1e-4);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use anyhow::Result;
 use candle_core::{Module, Tensor};
 use candle_nn::VarBuilder;
 
-use super::{CausalConv1d, CausalTransConv1d, SnakeBeta};
+use super::{causal_conv::CausalConvState, CausalConv1d, CausalTransConv1d, SnakeBeta};
 
 /// Residual unit used in decoder blocks
 ///
@@ -79,11 +79,20 @@ impl ResidualUnit {
     ///
     /// Input/Output shape: [batch, channels, seq_len]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_state(x, &mut None)
+    }
+
+    /// Streaming forward; `conv1_state` carries the dilated conv context.
+    pub fn forward_with_state(
+        &self,
+        x: &Tensor,
+        conv1_state: &mut CausalConvState,
+    ) -> Result<Tensor> {
         let residual = x.clone();
 
         // SnakeBeta -> dilated conv -> SnakeBeta -> 1x1 conv
         let hidden = self.act1.forward(x)?;
-        let hidden = self.conv1.forward(&hidden)?;
+        let hidden = self.conv1.forward_with_state(&hidden, conv1_state)?;
         let hidden = self.act2.forward(&hidden)?;
         let hidden = self.conv2.forward(&hidden)?;
 
@@ -96,6 +105,13 @@ impl Module for ResidualUnit {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         ResidualUnit::forward(self, x).map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
+}
+
+/// Streaming state of a [`DecoderBlock`].
+#[derive(Default)]
+pub struct DecoderBlockState {
+    upsample_overflow: Option<Tensor>,
+    res: [CausalConvState; 3],
 }
 
 /// BigVGAN-style decoder block with upsampling
@@ -238,11 +254,18 @@ impl DecoderBlock {
     /// Input shape: [batch, in_channels, seq_len]
     /// Output shape: [batch, out_channels, seq_len * upsample_rate]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_state(x, &mut DecoderBlockState::default())
+    }
+
+    /// Streaming forward (see [`CausalConv1d::forward_with_state`]).
+    pub fn forward_with_state(&self, x: &Tensor, state: &mut DecoderBlockState) -> Result<Tensor> {
         let hidden = self.snake.forward(x)?;
-        let hidden = self.upsample.forward(&hidden)?;
-        let hidden = self.res1.forward(&hidden)?;
-        let hidden = self.res2.forward(&hidden)?;
-        let hidden = self.res3.forward(&hidden)?;
+        let hidden = self
+            .upsample
+            .forward_with_state(&hidden, &mut state.upsample_overflow)?;
+        let hidden = self.res1.forward_with_state(&hidden, &mut state.res[0])?;
+        let hidden = self.res2.forward_with_state(&hidden, &mut state.res[1])?;
+        let hidden = self.res3.forward_with_state(&hidden, &mut state.res[2])?;
         Ok(hidden)
     }
 }

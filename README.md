@@ -48,7 +48,8 @@ Text ──→ [TalkerModel] ──→ semantic tokens (1 per frame)
 
 ### Prerequisites
 
-- **Rust** (1.75+) — [rustup.rs](https://rustup.rs)
+- **Rust** (1.75+) — [rustup.rs](https://rustup.rs), for the default `rust` backend
+- **uv** (optional) — [docs.astral.sh/uv](https://docs.astral.sh/uv/), only for the `mlx` backend (Apple Silicon)
 - **Bun** (optional, for Voice Recorder UI) — [bun.sh](https://bun.sh)
 
 ### One-command startup (server + UI)
@@ -61,9 +62,9 @@ bash scripts/start.sh
 
 This will:
 
-1. Build the Rust TTS server in release mode
+1. Prepare the TTS backend: a release build of the Rust server for `rust`, or `uv sync` for `mlx`
 2. Install Bun dependencies for the Voice Recorder UI
-3. Start the Bun server (auto-launches the Rust TTS server)
+3. Start the Bun server (auto-launches the selected TTS server)
 
 Once running:
 
@@ -71,6 +72,33 @@ Once running:
 - **Voice Recorder UI**: <https://localhost:3000>
 
 Model weights are downloaded automatically from HuggingFace Hub on first run.
+
+### TTS backends
+
+The Voice Recorder talks to one of two interchangeable servers on port 5001.
+Both implement the same HTTP API and binary streaming protocol.
+
+| Backend | Server | Platform | Notes |
+|---------|--------|----------|-------|
+| `rust` | `tts-server/` (Candle) | Metal / CUDA / CPU | Default everywhere |
+| `mlx` | `mlx-server/` (Python, [mlx-audio](https://github.com/Blaizzy/mlx-audio)) | Apple Silicon | Optional; can load quantized (4/8-bit) MLX checkpoints |
+
+Both serve voice cloning and the 9 CustomVoice preset speakers.
+
+Select it in `voice-recorder/.env`:
+
+```bash
+TTS_BACKEND=rust           # or mlx
+# TTS_MLX_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16          (default)
+# TTS_MLX_CV_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit (default; empty disables preset voices)
+```
+
+Measured on Apple Silicon (0.6B Base, ICL voice clone, streaming 0.8 s chunks,
+`cargo run --release --features metal,hub --example clone_stream_bench`):
+Candle 0.11 Metal BF16 RTF ≈ 0.54–0.61 (TTFB ≈ 0.57–0.61 s) vs mlx bf16
+RTF ≈ 0.65–0.70 (TTFB ≈ 0.57–0.60 s). 4-bit MLX checkpoints are ~2x faster
+again but occasionally fail to emit EOS, so mlx-server caps generation length
+relative to the text.
 
 ### Run TTS server only
 
@@ -94,6 +122,7 @@ CLI flags:
 |------|---------|-------------|
 | `--port` | `5001` | HTTP listen port |
 | `--model-path` | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Local path or HuggingFace model ID |
+| `--custom-voice-model` | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Model for the preset speakers; `""` disables them |
 | `--device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:N`, `metal` |
 | `--log-dir` | `logs` | Rolling daily log output directory |
 
@@ -131,9 +160,11 @@ let audio = model.synthesize("Custom settings!", Some(options))?;
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Model status, backend, queue size, uptime |
-| `POST` | `/extract-embedding` | Extract speaker embedding from reference audio, save to `.bin` |
+| `POST` | `/extract-embedding` | Precompute the voice prompt from reference audio (`.bin` for rust, `.npz` for mlx) |
 | `POST` | `/clone-stream` | Voice clone with streaming binary frame response |
-| `POST` | `/cache/clear` | Clear in-memory prompt cache |
+| `POST` | `/cache/clear` | Clear in-memory prompt cache (rust only) |
+| `GET` | `/speakers` | CustomVoice preset speakers (empty when disabled) |
+| `POST` | `/tts-stream` | Preset-speaker synthesis `{voice, text, language}`, same frame protocol |
 
 ### Streaming protocol
 
@@ -173,6 +204,21 @@ cargo build --release -p tts-server --no-default-features --features cuda
 cargo build --release -p tts-server --no-default-features --features cpu
 ```
 
+Windows + CUDA 13.x: build from a Visual Studio developer shell. candle-kernels
+0.11 needs MSVC's conforming preprocessor there
+([huggingface/candle#3686](https://github.com/huggingface/candle/issues/3686)):
+
+```powershell
+$env:CUDA_COMPUTE_CAP = "86"   # your GPU's compute capability, e.g. 86 for RTX 30xx
+$env:NVCC_PREPEND_FLAGS = "-Xcompiler /Zc:preprocessor"
+cargo build --release -p tts-server --no-default-features --features cuda
+```
+
+The fused SnakeBeta/SwiGLU kernels and the SDPA prefill path are Metal-only;
+other backends fall back to plain tensor ops. The algorithmic speedups
+(incremental streaming decoder, host-side sampling, fused RoPE, single prefill)
+apply to every backend.
+
 ## Project Structure
 
 ```text
@@ -191,8 +237,12 @@ qwen3-tts-candle/
 │       ├── routes.rs        # API handlers
 │       ├── streaming.rs     # Binary frame streaming protocol
 │       └── embedding.rs     # Speaker embedding serialization
+├── mlx-server/              # MLX TTS server (Python, Apple Silicon)
+│   ├── server.py            # Flask API, same protocol as tts-server
+│   ├── engine.py            # Single-thread MLX inference engine
+│   └── protocol.py          # Binary frame encoding
 ├── voice-recorder/          # Bun + React voice clone studio
-│   ├── src/                 # Bun backend (HTTPS, SSE, Rust bridge)
+│   ├── src/                 # Bun backend (HTTPS, SSE, TTS bridge)
 │   └── ui/                  # React SPA (profiles, recording, clone lab)
 └── scripts/
     ├── start.sh             # One-command build + run

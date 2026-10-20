@@ -19,12 +19,13 @@
 //! Stripping this prefix yields keys compatible with candle's Mimi format.
 
 use anyhow::Result;
-use candle_core::{DType, Device, Module, StreamingModule, Tensor};
+use candle_core::{DType, Device, StreamingModule, Tensor};
 use candle_transformers::models::mimi;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::seanet_encoder::SeaNetEncoder;
 use crate::audio::AudioBuffer;
 
 /// Mimi-based encoder producing 12Hz, 16-codebook codes from raw audio.
@@ -32,7 +33,7 @@ use crate::audio::AudioBuffer;
 /// Constructs the encoder-only path from candle's Mimi components (no
 /// decoder). Used by ICL voice cloning to tokenize reference audio.
 pub struct Encoder12Hz {
-    encoder: mimi::seanet::SeaNetEncoder,
+    encoder: SeaNetEncoder,
     // RefCell because ProjectedTransformer::forward/reset_state need &mut self
     encoder_transformer: RefCell<mimi::transformer::ProjectedTransformer>,
     downsample: mimi::conv::ConvDownsample1d,
@@ -73,7 +74,7 @@ impl Encoder12Hz {
         let cfg = mimi::Config::v0_1(Some(16));
         let vb = candle_nn::VarBuilder::from_tensors(encoder_weights, DType::F32, device);
 
-        let encoder = mimi::seanet::SeaNetEncoder::new(&cfg.seanet, vb.pp("encoder"))?;
+        let encoder = SeaNetEncoder::new(cfg.seanet.dimension, vb.pp("encoder"))?;
         let encoder_transformer = mimi::transformer::ProjectedTransformer::new(
             cfg.seanet.dimension,
             &[cfg.seanet.dimension],

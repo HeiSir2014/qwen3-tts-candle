@@ -6,6 +6,7 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use num_complex::Complex;
+use rayon::prelude::*;
 use rustfft::{num_complex::Complex as FftComplex, FftPlanner};
 use std::f32::consts::PI;
 
@@ -47,6 +48,8 @@ pub struct MelSpectrogram {
     config: MelConfig,
     /// Precomputed mel filterbank
     mel_basis: Vec<Vec<f32>>,
+    /// Per filter, the `[start, end)` frequency bins with non-zero weight
+    mel_ranges: Vec<(usize, usize)>,
     /// Precomputed Hann window
     window: Vec<f32>,
 }
@@ -82,12 +85,24 @@ impl MelSpectrogram {
             fmax,
         );
 
+        // Triangular filters are non-zero on a few bins only; skipping the
+        // zeros gives bit-identical sums.
+        let mel_ranges = mel_basis
+            .iter()
+            .map(|filter| {
+                let start = filter.iter().position(|&w| w != 0.0).unwrap_or(0);
+                let end = filter.iter().rposition(|&w| w != 0.0).map_or(0, |i| i + 1);
+                (start, end.max(start))
+            })
+            .collect();
+
         // Compute Hann window
         let window = Self::hann_window(win_length);
 
         Self {
             config,
             mel_basis,
+            mel_ranges,
             window,
         }
     }
@@ -211,47 +226,53 @@ impl MelSpectrogram {
         let fft = planner.plan_fft_forward(n_fft);
 
         let n_frames = (padded.len() - n_fft) / hop_length + 1;
-        let mut result = Vec::with_capacity(n_frames);
 
-        for i in 0..n_frames {
-            let start = i * hop_length;
+        // Frames are independent: transform them in parallel.
+        (0..n_frames)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * hop_length;
 
-            // Apply window and prepare FFT input
-            let mut buffer: Vec<FftComplex<f32>> = (0..n_fft)
-                .map(|j| {
-                    let sample = if j < win_length && start + j < padded.len() {
-                        padded[start + j] * self.window[j]
-                    } else {
-                        0.0
-                    };
-                    FftComplex::new(sample, 0.0)
-                })
-                .collect();
+                // Apply window and prepare FFT input
+                let mut buffer: Vec<FftComplex<f32>> = (0..n_fft)
+                    .map(|j| {
+                        let sample = if j < win_length && start + j < padded.len() {
+                            padded[start + j] * self.window[j]
+                        } else {
+                            0.0
+                        };
+                        FftComplex::new(sample, 0.0)
+                    })
+                    .collect();
 
-            // Perform FFT
-            fft.process(&mut buffer);
+                // Perform FFT
+                fft.process(&mut buffer);
 
-            // Take positive frequencies only (n_fft/2 + 1)
-            let frame: Vec<Complex<f32>> = buffer
-                .iter()
-                .take(n_fft / 2 + 1)
-                .map(|c| Complex::new(c.re, c.im))
-                .collect();
-
-            result.push(frame);
-        }
-
-        result
+                // Take positive frequencies only (n_fft/2 + 1)
+                buffer
+                    .iter()
+                    .take(n_fft / 2 + 1)
+                    .map(|c| Complex::new(c.re, c.im))
+                    .collect()
+            })
+            .collect()
     }
 
     /// Apply mel filterbank to power spectrogram
     fn apply_mel_filterbank(&self, power_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
         power_spec
-            .iter()
+            .par_iter()
             .map(|frame| {
                 self.mel_basis
                     .iter()
-                    .map(|filter| filter.iter().zip(frame.iter()).map(|(f, p)| f * p).sum())
+                    .zip(&self.mel_ranges)
+                    .map(|(filter, &(start, end))| {
+                        filter[start..end]
+                            .iter()
+                            .zip(&frame[start..end])
+                            .map(|(f, p)| f * p)
+                            .sum()
+                    })
                     .collect()
             })
             .collect()
@@ -411,6 +432,25 @@ mod tests {
         let mel = MelSpectrogram::new(MelConfig::default());
         assert_eq!(mel.mel_basis.len(), 128);
         assert_eq!(mel.mel_basis[0].len(), 201); // n_fft/2 + 1 = 400/2 + 1
+    }
+
+    #[test]
+    fn test_sparse_filterbank_matches_dense() {
+        let mel = MelSpectrogram::new(MelSpectrogram::speaker_encoder());
+        let n_bins = mel.mel_basis[0].len();
+        let frames: Vec<Vec<f32>> = (0..5)
+            .map(|f| (0..n_bins).map(|b| ((b * 7 + f * 13) % 17) as f32 * 0.37).collect())
+            .collect();
+        let dense: Vec<Vec<f32>> = frames
+            .iter()
+            .map(|frame| {
+                mel.mel_basis
+                    .iter()
+                    .map(|filter| filter.iter().zip(frame).map(|(f, p)| f * p).sum())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(mel.apply_mel_filterbank(&frames), dense);
     }
 
     #[test]

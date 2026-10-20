@@ -7,7 +7,7 @@ use anyhow::Result;
 use candle_core::{Module, Tensor};
 use candle_nn::{layer_norm, linear, LayerNorm, LayerNormConfig, Linear, VarBuilder};
 
-use super::CausalConv1d;
+use super::{causal_conv::CausalConvState, CausalConv1d};
 
 /// ConvNeXt Block
 ///
@@ -108,10 +108,19 @@ impl ConvNeXtBlock {
     /// Input shape: [batch, channels, seq_len]
     /// Output shape: [batch, channels, seq_len]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_state(x, &mut None)
+    }
+
+    /// Streaming forward; `dwconv_state` carries the depthwise conv context.
+    pub fn forward_with_state(
+        &self,
+        x: &Tensor,
+        dwconv_state: &mut CausalConvState,
+    ) -> Result<Tensor> {
         let residual = x.clone();
 
         // Depthwise causal conv
-        let hidden = self.dwconv.forward(x)?;
+        let hidden = self.dwconv.forward_with_state(x, dwconv_state)?;
 
         // Transpose: [B, C, T] -> [B, T, C]
         let hidden = hidden.transpose(1, 2)?;

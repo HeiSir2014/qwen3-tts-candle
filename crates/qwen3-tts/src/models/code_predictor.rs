@@ -209,6 +209,7 @@ impl CodePredictor {
             config.head_dim,
             1024, // Max sequence length for code predictor
             config.rope_theta,
+            vb.dtype(),
             vb.device(),
         )?);
 
@@ -367,16 +368,14 @@ impl CodePredictor {
         hidden = self.norm.forward(&hidden)?;
 
         // Step 2: Predict first acoustic code from last position
-        // Keep codes as GPU tensors to avoid per-step GPU→CPU syncs.
-        // Pre-allocate a single [num_acoustic] tensor and write each code into it
-        // to avoid Tensor::cat overhead on many small tensors.
+        // Keep codes as GPU tensors to avoid per-step GPU→CPU syncs; they are
+        // concatenated once at the end.
         let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
         let logits = self.lm_heads[0].forward(&last_hidden)?;
         let first_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor on GPU
 
-        let mut all_codes = Tensor::zeros(num_acoustic, candle_core::DType::U32, device)?;
-        let range = 0..1;
-        all_codes = all_codes.slice_assign(&[range], &first_code)?;
+        let mut codes = Vec::with_capacity(num_acoustic);
+        codes.push(first_code.clone());
 
         // Also keep a reference to the latest code for embedding lookup
         let mut prev_code = first_code;
@@ -406,13 +405,12 @@ impl CodePredictor {
             // Predict next code (stays on GPU)
             let logits = self.lm_heads[group_idx].forward(&h)?;
             let next_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor on GPU
-            let range = group_idx..group_idx + 1;
-            all_codes = all_codes.slice_assign(&[range], &next_code)?;
+            codes.push(next_code.clone());
             prev_code = next_code;
             offset += 1;
         }
 
-        Ok(all_codes)
+        Ok(Tensor::cat(&codes, 0)?)
     }
 
     fn create_causal_mask(&self, seq_len: usize, device: &candle_core::Device) -> Result<Tensor> {

@@ -163,75 +163,76 @@ async fn run_clone_stream(
         return Err(format!("Server error {}: {}", status, body_text));
     }
 
-    // Read the full response body and parse binary frames
-    let response_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read response: {}", e))?;
-
-    let mut buffer = &response_bytes[..];
+    // Parse binary frames as they arrive so TTFB is the first audio frame,
+    // not the end of the response body.
+    let mut resp = resp;
+    let mut pending: Vec<u8> = Vec::new();
     let mut ttfb: Option<Duration> = None;
     let mut chunks: u32 = 0;
     let mut total_pcm_bytes: usize = 0;
     let mut sample_rate: u32 = 24000;
     let mut chunk_latencies_ms: Vec<f64> = Vec::new();
     let mut last_chunk_time = start;
+    let mut ended = false;
 
-    while buffer.len() >= HEADER_SIZE {
-        let field0 = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-        let field1 = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
-        let field2 = u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
-        let field3 = u32::from_be_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]);
+    while !ended {
+        let Some(bytes) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?
+        else {
+            break; // stream closed (possibly truncated)
+        };
+        pending.extend_from_slice(&bytes);
 
-        // Detect frame type from marker positions
-        // Audio frame:  [chunkIndex][MARKER_AUDIO][sampleRate][dataLen]
-        // End frame:    [MARKER_END][totalChunks][0][0]
-        // Error frame:  [MARKER_ERROR][0][0][msgLen]
+        let mut consumed = 0;
+        while pending.len() - consumed >= HEADER_SIZE {
+            let buffer = &pending[consumed..];
+            let field0 = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+            let field1 = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+            let field2 = u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
+            let field3 = u32::from_be_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]);
 
-        if field0 == MARKER_END {
-            // End-of-stream
-            break;
-        }
+            // Detect frame type from marker positions
+            // Audio frame:  [chunkIndex][MARKER_AUDIO][sampleRate][dataLen]
+            // End frame:    [MARKER_END][totalChunks][0][0]
+            // Error frame:  [MARKER_ERROR][0][0][msgLen]
 
-        if field0 == MARKER_ERROR {
-            let msg_len = field3 as usize;
-            let frame_size = HEADER_SIZE + msg_len;
-            if buffer.len() < frame_size {
-                return Err("Truncated error frame".into());
-            }
-            let msg = std::str::from_utf8(&buffer[HEADER_SIZE..frame_size])
-                .unwrap_or("(invalid utf8)");
-            return Err(format!("Server error: {}", msg));
-        }
-
-        if field1 == MARKER_AUDIO {
-            // Audio frame
-            let data_len = field3 as usize;
-            let frame_size = HEADER_SIZE + data_len;
-            if buffer.len() < frame_size {
-                break; // truncated
-            }
-
-            let now = Instant::now();
-            if ttfb.is_none() {
-                ttfb = Some(now.duration_since(start));
-            }
-            chunk_latencies_ms.push(now.duration_since(last_chunk_time).as_secs_f64() * 1000.0);
-            last_chunk_time = now;
-
-            sample_rate = field2;
-            total_pcm_bytes += data_len;
-            chunks += 1;
-            buffer = &buffer[frame_size..];
-        } else {
-            // Unknown frame — skip based on field3 as data_len
-            let data_len = field3 as usize;
-            let frame_size = HEADER_SIZE + data_len;
-            if buffer.len() < frame_size {
+            if field0 == MARKER_END {
+                // End-of-stream
+                ended = true;
                 break;
             }
-            buffer = &buffer[frame_size..];
+
+            // Every other frame is a header followed by `field3` payload bytes
+            let frame_size = HEADER_SIZE + field3 as usize;
+            if buffer.len() < frame_size {
+                break; // wait for the rest of the frame
+            }
+
+            if field0 == MARKER_ERROR {
+                let msg = std::str::from_utf8(&buffer[HEADER_SIZE..frame_size])
+                    .unwrap_or("(invalid utf8)");
+                return Err(format!("Server error: {}", msg));
+            }
+
+            if field1 == MARKER_AUDIO {
+                let now = Instant::now();
+                if ttfb.is_none() {
+                    ttfb = Some(now.duration_since(start));
+                }
+                chunk_latencies_ms
+                    .push(now.duration_since(last_chunk_time).as_secs_f64() * 1000.0);
+                last_chunk_time = now;
+
+                sample_rate = field2;
+                total_pcm_bytes += field3 as usize;
+                chunks += 1;
+            }
+            // Unknown frames are skipped
+            consumed += frame_size;
         }
+        pending.drain(..consumed);
     }
 
     let total_duration = start.elapsed();

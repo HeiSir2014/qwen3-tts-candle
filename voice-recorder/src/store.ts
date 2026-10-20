@@ -2,8 +2,12 @@ import { join } from "path";
 import { mkdir, unlink, rm, rename } from "fs/promises";
 import { $ } from "bun";
 import { createLogger } from "./logger";
+import { EMBEDDING_EXTENSION } from "./tts-bridge";
 
 const log = createLogger("store");
+
+/** Pseudo profile that owns preset-voice (CustomVoice) TTS jobs. */
+export const SYSTEM_PROFILE_ID = "__system__";
 
 const DATA_DIR = join(import.meta.dir, "..", "data");
 const PROFILES_FILE = join(DATA_DIR, "profiles.json");
@@ -216,7 +220,7 @@ export function getAudioPath(profileId: string, recordingId: string): string {
 }
 
 export function getEmbeddingPath(profileId: string, recordingId: string): string {
-  return join(RECORDINGS_DIR, profileId, `${recordingId}.bin`);
+  return join(RECORDINGS_DIR, profileId, `${recordingId}${EMBEDDING_EXTENSION}`);
 }
 
 export async function updateEmbeddingStatus(
@@ -264,7 +268,9 @@ export interface TtsJob {
   completedAt?: string;
   chunksCompleted?: number;
   chunksTotal?: number;
-  mode?: "single" | "dialog";
+  mode?: "single" | "dialog" | "tts";
+  /** Preset speaker id for mode "tts" (profileId is SYSTEM_PROFILE_ID). */
+  voice?: string;
   dialogSegments?: DialogSegment[];
   profileIds?: string[];
   audioDurationS?: number;
@@ -300,7 +306,8 @@ export async function createTtsJob(
   text: string,
   language: string,
   options?: {
-    mode?: "single" | "dialog";
+    mode?: TtsJob["mode"];
+    voice?: string;
     dialogSegments?: DialogSegment[];
     profileIds?: string[];
   }
@@ -316,6 +323,7 @@ export async function createTtsJob(
       status: "processing",
       createdAt: new Date().toISOString(),
       ...(options?.mode && { mode: options.mode }),
+      ...(options?.voice && { voice: options.voice }),
       ...(options?.dialogSegments && { dialogSegments: options.dialogSegments }),
       ...(options?.profileIds && { profileIds: options.profileIds }),
     };

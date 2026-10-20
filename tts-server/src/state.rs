@@ -5,7 +5,11 @@ use std::time::Instant;
 use std::path::Path;
 
 use anyhow::Result;
-use qwen3_tts::{auto_device, device_info, ModelPaths, Qwen3TTS};
+use candle_core::Device;
+use qwen3_tts::{
+    auto_device, device_info, AudioBuffer, Language, ModelPaths, Qwen3TTS, Speaker,
+    SynthesisOptions,
+};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::embedding::SerializablePrompt;
@@ -17,6 +21,8 @@ use crate::embedding::SerializablePrompt;
 pub struct AppState {
     /// The loaded TTS model. Uses std Mutex so it can be locked from blocking contexts.
     pub model: StdMutex<Qwen3TTS>,
+    /// Optional CustomVoice model serving the preset speakers.
+    pub custom_voice: Option<StdMutex<Qwen3TTS>>,
     /// Cache of pre-computed voice clone prompts, keyed by embedding file path.
     pub prompt_cache: TokioMutex<HashMap<String, SerializablePrompt>>,
     /// Number of requests currently waiting for the model lock.
@@ -30,8 +36,15 @@ pub struct AppState {
 const MAX_CACHE_SIZE: usize = 50;
 
 impl AppState {
-    /// Load the model and create a new AppState.
-    pub fn new(model_path: &str, device_str: &str) -> Result<Self> {
+    /// Load the model(s) and create a new AppState.
+    ///
+    /// `custom_voice_path` is the CustomVoice model for preset speakers;
+    /// `None` disables `/speakers` and `/tts-stream`.
+    pub fn new(
+        model_path: &str,
+        custom_voice_path: Option<&str>,
+        device_str: &str,
+    ) -> Result<Self> {
         let device = if device_str == "auto" {
             auto_device()?
         } else {
@@ -39,32 +52,43 @@ impl AppState {
         };
 
         let label = device_info(&device);
-        tracing::info!("Loading model from: {}", model_path);
         tracing::info!("Device: {}", label);
 
-        let local_path = Path::new(model_path);
-        let model = if local_path.join("model.safetensors").exists() {
-            // Local directory with weights
-            tracing::info!("Loading from local path...");
-            Qwen3TTS::from_pretrained(model_path, device)?
-        } else {
-            // Download from HuggingFace Hub
-            tracing::info!("Downloading model from HuggingFace Hub...");
-            let paths = ModelPaths::download(Some(model_path))?;
-            Qwen3TTS::from_paths(&paths, device)?
-        };
-        tracing::info!("Model loaded successfully");
-
+        let model = load_model(model_path, device.clone())?;
         // Warmup: run a short synthesis to JIT-compile Metal/CUDA kernels
         // so the first real request doesn't pay the compilation cost.
         tracing::info!("Warming up model (short synthesis)...");
         match model.synthesize("warmup", None) {
-            Ok(_) => tracing::info!("Warmup complete"),
+            Ok(audio) => {
+                tracing::info!("Warmup complete");
+                if model.supports_voice_cloning() {
+                    match warm_up_clone(&model, &audio) {
+                        Ok(()) => tracing::info!("Voice clone warmup complete"),
+                        Err(e) => tracing::warn!("Voice clone warmup failed (non-fatal): {}", e),
+                    }
+                }
+            }
             Err(e) => tracing::warn!("Warmup synthesis failed (non-fatal): {}", e),
         }
 
+        let custom_voice = match custom_voice_path {
+            Some(path) => {
+                let cv = load_model(path, device)?;
+                if !cv.supports_preset_speakers() {
+                    anyhow::bail!("{} is not a CustomVoice model", path);
+                }
+                match cv.synthesize_with_voice("warmup", Speaker::Serena, Language::Chinese, None) {
+                    Ok(_) => tracing::info!("CustomVoice warmup complete"),
+                    Err(e) => tracing::warn!("CustomVoice warmup failed (non-fatal): {}", e),
+                }
+                Some(StdMutex::new(cv))
+            }
+            None => None,
+        };
+
         Ok(Self {
             model: StdMutex::new(model),
+            custom_voice,
             prompt_cache: TokioMutex::new(HashMap::new()),
             queue_size: TokioMutex::new(0),
             started_at: Instant::now(),
@@ -82,7 +106,6 @@ impl AppState {
         }
         cache.insert(key, serializable);
     }
-
 
     pub async fn cache_size(&self) -> usize {
         self.prompt_cache.lock().await.len()
@@ -105,4 +128,35 @@ impl AppState {
     pub async fn get_queue_size(&self) -> u32 {
         *self.queue_size.lock().await
     }
+}
+
+/// Run the /clone-stream path once (prompt extraction + first streamed chunk)
+/// so the first real request doesn't pay its kernel compilation: the plain
+/// warmup synthesis never touches the speaker/speech encoders or the ICL
+/// decoder priming. `reference` is the warmup synthesis output.
+fn warm_up_clone(model: &Qwen3TTS, reference: &AudioBuffer) -> Result<()> {
+    let prompt = model.create_voice_clone_prompt(reference, Some("warmup"))?;
+    let mut session = model.synthesize_voice_clone_streaming(
+        "warmup",
+        &prompt,
+        Language::Chinese,
+        SynthesisOptions::default(),
+    )?;
+    session.next().transpose()?;
+    Ok(())
+}
+
+/// Load a model from a local weights directory or a HuggingFace model ID.
+fn load_model(model_path: &str, device: Device) -> Result<Qwen3TTS> {
+    tracing::info!("Loading model from: {}", model_path);
+    let model = if Path::new(model_path).join("model.safetensors").exists() {
+        tracing::info!("Loading from local path...");
+        Qwen3TTS::from_pretrained(model_path, device)?
+    } else {
+        tracing::info!("Downloading model from HuggingFace Hub...");
+        let paths = ModelPaths::download(Some(model_path))?;
+        Qwen3TTS::from_paths(&paths, device)?
+    };
+    tracing::info!("Model loaded successfully");
+    Ok(model)
 }

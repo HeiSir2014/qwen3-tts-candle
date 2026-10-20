@@ -1,4 +1,4 @@
-import type { Profile, Recording, Script, TtsJob } from "./types";
+import type { Profile, Recording, Script, SystemProfile, TtsJob } from "./types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -100,6 +100,22 @@ export function cloneDialogSubmit(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, language, profileMapping }),
+  }).then((r) => json<{ jobId: string }>(r));
+}
+
+export function getSystemProfiles(): Promise<SystemProfile[]> {
+  return fetch("/api/system-profiles").then((r) => json<SystemProfile[]>(r));
+}
+
+export function ttsSubmit(
+  voice: string,
+  text: string,
+  language: string
+): Promise<{ jobId: string }> {
+  return fetch("/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ voice, text, language }),
   }).then((r) => json<{ jobId: string }>(r));
 }
 

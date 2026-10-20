@@ -13,6 +13,8 @@ pub mod codec;
 pub mod config;
 pub mod fused_ops;
 pub mod kv_cache;
+#[cfg(feature = "metal")]
+pub mod metal_ops;
 pub mod speaker;
 pub mod talker;
 pub mod transformer;

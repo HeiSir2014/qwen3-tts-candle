@@ -2,12 +2,36 @@ import { spawn, type Subprocess, $ } from "bun";
 import { join } from "path";
 import { createLogger, startTimer } from "./logger";
 
-const log = createLogger("rust-bridge");
+const log = createLogger("tts-bridge");
 
 const PROJECT_ROOT = join(import.meta.dir, "..", "..");
 const TTS_BINARY = join(PROJECT_ROOT, "target", "release", "tts-server");
+const MLX_SERVER_DIR = join(PROJECT_ROOT, "mlx-server");
 const TTS_PORT = 5001;
 const TTS_URL = `http://127.0.0.1:${TTS_PORT}`;
+
+/**
+ * "rust" — tts-server (Candle, default); "mlx" — mlx-server (Python, Apple Silicon).
+ * Both speak the same HTTP + binary frame protocol, preset voices included.
+ */
+export type TtsBackend = "mlx" | "rust";
+
+function resolveBackend(value: string | undefined): TtsBackend {
+  if (value === "mlx" || value === "rust") return value;
+  if (value) throw new Error(`Invalid TTS_BACKEND "${value}" (expected "mlx" or "rust")`);
+  return "rust";
+}
+
+export const TTS_BACKEND = resolveBackend(process.env.TTS_BACKEND);
+
+/** Voice prompt files are backend-specific: Rust bincode vs MLX npz. */
+export const EMBEDDING_EXTENSION = TTS_BACKEND === "mlx" ? ".npz" : ".bin";
+
+function serverCommand(): string[] {
+  return TTS_BACKEND === "mlx"
+    ? ["uv", "run", "--directory", MLX_SERVER_DIR, "server.py", "--port", String(TTS_PORT)]
+    : [TTS_BINARY, "--port", String(TTS_PORT)];
+}
 
 let ttsProcess: Subprocess | null = null;
 let intentionalKill = false;
@@ -53,14 +77,14 @@ function watchProcess(proc: Subprocess) {
 }
 
 export async function startTtsServer(): Promise<void> {
-  log.info("Starting Rust TTS server...");
+  log.info(`Starting ${TTS_BACKEND} TTS server...`);
   intentionalKill = false;
 
   // Kill any orphaned process still holding the port
   await killExistingOnPort(TTS_PORT);
 
   ttsProcess = spawn({
-    cmd: [TTS_BINARY, "--port", String(TTS_PORT)],
+    cmd: serverCommand(),
     stdout: "inherit",
     stderr: "inherit",
   });
@@ -75,7 +99,7 @@ export async function startTtsServer(): Promise<void> {
       const res = await fetch(`${TTS_URL}/health`);
       if (res.ok) {
         restartCount = 0;
-        log.info("Rust TTS server is ready!");
+        log.info(`${TTS_BACKEND} TTS server is ready!`);
         return;
       }
     } catch {
@@ -83,7 +107,7 @@ export async function startTtsServer(): Promise<void> {
     }
     await Bun.sleep(1000);
   }
-  log.warn("Rust TTS server did not become ready in time. Clone features may not work.");
+  log.warn(`${TTS_BACKEND} TTS server did not become ready in time. Clone features may not work.`);
 }
 
 export async function stopTtsServer(): Promise<void> {
@@ -91,8 +115,21 @@ export async function stopTtsServer(): Promise<void> {
   if (ttsProcess) {
     ttsProcess.kill();
     ttsProcess = null;
-    log.info("Rust TTS server stopped.");
+    log.info(`${TTS_BACKEND} TTS server stopped.`);
   }
+}
+
+export interface SystemVoice {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** Preset CustomVoice speakers; empty when the server has no CustomVoice model. */
+export async function fetchSystemVoices(): Promise<SystemVoice[]> {
+  const res = await fetch(`${TTS_URL}/speakers`, { signal: AbortSignal.timeout(3000) });
+  if (!res.ok) throw new Error(`TTS server error (${res.status})`);
+  return (await res.json()) as SystemVoice[];
 }
 
 export async function checkTtsHealth(): Promise<boolean> {
@@ -226,7 +263,7 @@ export interface CloneStreamChunk {
   pcmData: Uint8Array; // int16 LE
 }
 
-export async function* requestCloneStream(
+export function requestCloneStream(
   body: {
     ref_audio_path: string;
     ref_text: string;
@@ -236,23 +273,39 @@ export async function* requestCloneStream(
   },
   requestId?: string
 ): AsyncGenerator<CloneStreamChunk, void, undefined> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (requestId) headers["X-Request-Id"] = requestId;
-
   log.info("clone_stream_start", {
     requestId,
     text_length: body.text.length,
     has_embedding: !!body.embedding_path,
     has_ref_text: !!body.ref_text?.trim(),
   });
+  return requestFrameStream("/clone-stream", body, requestId);
+}
+
+/** Preset-voice synthesis (CustomVoice model), same frame protocol as cloning. */
+export function requestTtsStream(
+  body: { voice: string; text: string; language: string },
+  requestId?: string
+): AsyncGenerator<CloneStreamChunk, void, undefined> {
+  log.info("tts_stream_start", { requestId, voice: body.voice, text_length: body.text.length });
+  return requestFrameStream("/tts-stream", body, requestId);
+}
+
+async function* requestFrameStream(
+  endpoint: string,
+  body: object,
+  requestId?: string
+): AsyncGenerator<CloneStreamChunk, void, undefined> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (requestId) headers["X-Request-Id"] = requestId;
 
   const streamStartTime = Date.now();
 
   let res: Response;
   try {
-    res = await fetch(`${TTS_URL}/clone-stream`, {
+    res = await fetch(`${TTS_URL}${endpoint}`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),

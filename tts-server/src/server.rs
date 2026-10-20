@@ -61,6 +61,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(routes::health))
         .route("/extract-embedding", post(routes::extract_embedding))
         .route("/clone-stream", post(routes::clone_stream))
+        .route("/speakers", get(routes::speakers))
+        .route("/tts-stream", post(routes::tts_stream))
         .route("/cache/clear", post(routes::clear_cache))
         .with_state(state)
         .layer(cors)
