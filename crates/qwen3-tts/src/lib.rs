@@ -877,8 +877,9 @@ impl Qwen3TTS {
 
         let gen_config = options.to_gen_config();
 
-        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
-            self.build_trailing_text(&input_ids)?;
+        // The whole text goes into the prefill; generation only adds tts_pad.
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len) = (tts_pad_embed.clone(), 0);
 
         // Prefill with VoiceDesign format
         #[cfg(feature = "profiling")]
@@ -1686,8 +1687,9 @@ impl<'a> StreamingSession<'a> {
         let sampling_ctx = generation::SamplingContext::new(options.seed);
         let config = options.to_gen_config();
 
-        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
-            model.build_trailing_text(input_ids)?;
+        // The whole text goes into the prefill; generation only adds tts_pad.
+        let tts_pad_embed = model.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len) = (tts_pad_embed.clone(), 0);
 
         let mut kv_caches = model.talker.new_kv_caches(config.max_new_tokens + 256);
         let prefill_result =
