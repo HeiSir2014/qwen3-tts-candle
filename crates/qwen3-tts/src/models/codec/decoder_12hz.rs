@@ -466,6 +466,25 @@ impl Decoder12Hz {
         codes: &Tensor,
         state: &mut DecoderStreamState,
     ) -> Result<Tensor> {
+        let hidden = self.frame_features(codes, state)?;
+        self.upsample_to_audio(hidden, state)
+    }
+
+    /// Feed context codes through the frame-rate part of the decoder
+    /// (quantizer, pre-conv, transformer) without synthesizing audio.
+    ///
+    /// The next [`Self::decode_with_state`] call then attends to these frames
+    /// in the transformer, while the audio-rate conv stack starts from silence
+    /// as at the beginning of any decode. Costs a few ms instead of a full
+    /// decode of the context.
+    pub fn prime_with_state(&self, codes: &Tensor, state: &mut DecoderStreamState) -> Result<()> {
+        self.frame_features(codes, state)?;
+        Ok(())
+    }
+
+    /// Quantizer → pre-conv → transformer: `[batch, 16, seq]` codes to
+    /// `[batch, latent_dim, seq]` frame-rate features.
+    fn frame_features(&self, codes: &Tensor, state: &mut DecoderStreamState) -> Result<Tensor> {
         let device = codes.device();
         let (batch_size, _num_quantizers, seq_len) = codes.dims3()?;
 
@@ -536,9 +555,18 @@ impl Decoder12Hz {
             Some(&self.output_proj_bias),
         )?;
 
-        // 4. Transpose for conv: [batch, seq, 1024] -> [batch, 1024, seq]
-        let mut hidden = hidden.transpose(1, 2)?;
+        state.frames += seq_len;
 
+        // 4. Transpose for conv: [batch, seq, 1024] -> [batch, 1024, seq]
+        Ok(hidden.transpose(1, 2)?)
+    }
+
+    /// Upsampling + BigVGAN conv stack: frame-rate features to audio.
+    fn upsample_to_audio(
+        &self,
+        mut hidden: Tensor,
+        state: &mut DecoderStreamState,
+    ) -> Result<Tensor> {
         // 5. Upsample stages
         state
             .upsample
@@ -567,7 +595,6 @@ impl Decoder12Hz {
         hidden = self
             .final_conv
             .forward_with_state(&hidden, &mut state.final_conv)?;
-        state.frames += seq_len;
 
         // 10. Clamp to [-1, 1] per official implementation
         // The decoder outputs values in a large range (e.g., [-27, 27])

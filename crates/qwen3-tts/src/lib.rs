@@ -1527,10 +1527,6 @@ pub const CODEC_EOS_TOKEN_ID: u32 = codec_tokens::CODEC_EOS;
 /// Number of audio samples per codec frame at 24kHz (1920 = 80ms per frame at 12Hz).
 pub const SAMPLES_PER_FRAME: usize = 1920;
 
-/// ICL mode: reference frames decoded as left context before the first
-/// streaming chunk (the reference implementation's `left_context_size`).
-const ICL_DECODER_CONTEXT_FRAMES: usize = 25;
-
 /// ICL mode: minimum frames to generate regardless of text length (matching mlx-audio)
 const ICL_MIN_FRAMES: usize = 75;
 
@@ -1612,12 +1608,8 @@ pub struct StreamingSession<'a> {
     token_count: usize,
     // Pre-allocated code predictor KV caches (reused + reset each frame)
     cp_kv_caches: Vec<AnyKVCache>,
-    // ICL reference codes for decoder context (voice cloning only).
-    // The tail of ref_codes is prepended to the first chunk so the decoder
-    // starts from the reference voice; its audio is trimmed from the output.
-    // Taken (None) once the first chunk is decoded. GPU tensor [T_ref, 16].
-    icl_ref_codes: Option<Tensor>,
     // Incremental decoder state: each chunk only decodes its new frames.
+    // For ICL voice cloning it is primed with the reference codes.
     decoder_state: DecoderStreamState,
     // Repetition detection: stop when the same semantic token repeats consecutively
     last_token: u32,
@@ -1658,7 +1650,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             options.chunk_frames,
-            None, // no ICL ref codes for custom voice
+            DecoderStreamState::default(),
         )
     }
 
@@ -1698,7 +1690,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             options.chunk_frames,
-            None, // no ICL ref codes for voice design
+            DecoderStreamState::default(),
         )
     }
 
@@ -1751,7 +1743,7 @@ impl<'a> StreamingSession<'a> {
         let (mut offset, mut last_hidden, mut logits) = Self::unpack_prefill(&prefill_result)?;
 
         // ICL extension if needed — mirrors synthesize_voice_clone_debug logic
-        let mut icl_ref_codes: Option<Tensor> = None;
+        let mut decoder_state = DecoderStreamState::default();
         let trailing_text_hidden = if let (Some(ref_codes), Some(ref_text_ids)) =
             (&prompt.ref_codes, &prompt.ref_text_ids)
         {
@@ -1783,9 +1775,14 @@ impl<'a> StreamingSession<'a> {
                 logits = model.talker.apply_codec_head(&last_icl_hidden)?;
                 last_hidden = last_icl_hidden;
 
-                // Store ref_codes tensor directly as decoder context for the
-                // first chunk. Keeping as GPU tensor avoids CPU roundtrips.
-                icl_ref_codes = Some(ref_codes.to_dtype(DType::U32)?);
+                // Give the codec decoder's transformer the reference frames as
+                // context (the reference implementation decodes ref + generated
+                // codes together). Only the frame-rate part runs, so this costs
+                // a few ms instead of decoding the reference audio.
+                let ref_codes = ref_codes.t()?.unsqueeze(0)?.to_dtype(DType::I64)?;
+                model
+                    .decoder
+                    .prime_with_state(&ref_codes, &mut decoder_state)?;
 
                 icl_trailing
             } else {
@@ -1811,7 +1808,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             options.chunk_frames,
-            icl_ref_codes,
+            decoder_state,
         )
     }
 
@@ -1845,7 +1842,7 @@ impl<'a> StreamingSession<'a> {
         trailing_text_len: usize,
         tts_pad_embed: Tensor,
         chunk_frames: usize,
-        icl_ref_codes: Option<Tensor>,
+        decoder_state: DecoderStreamState,
     ) -> Result<Self> {
         // Sample first token with full penalty pipeline
         let mut sampler = SemanticSampler::new()?;
@@ -1874,40 +1871,24 @@ impl<'a> StreamingSession<'a> {
             sampler,
             token_count: 1,
             cp_kv_caches,
-            icl_ref_codes,
-            decoder_state: DecoderStreamState::default(),
+            decoder_state,
             last_token: first_token_id,
             repeat_count: 0,
             profile: None,
         })
     }
 
-    /// Incrementally decode buffered frames to audio.
-    ///
-    /// All frame data stays on GPU. On the first chunk of an ICL session the
-    /// last [`ICL_DECODER_CONTEXT_FRAMES`] reference frames are decoded in
-    /// front of the generated ones (as the reference implementation's
-    /// left-context decoding does) and their audio is trimmed.
+    /// Incrementally decode buffered frames to audio (all on GPU).
     fn decode_frame_buffer(&mut self) -> Result<AudioBuffer> {
-        let generated = Tensor::stack(&self.frame_buffer, 0)?; // [T_gen, 16]
-        let (codes, context_frames) = match self.icl_ref_codes.take() {
-            Some(ref_codes) => {
-                let ref_len = ref_codes.dim(0)?;
-                let context = ref_len.min(ICL_DECODER_CONTEXT_FRAMES);
-                let context_codes = ref_codes.narrow(0, ref_len - context, context)?;
-                (Tensor::cat(&[&context_codes, &generated], 0)?, context)
-            }
-            None => (generated, 0),
-        };
-
-        // Decoder format: [1, 16, T]
-        let codes = codes.t()?.unsqueeze(0)?.to_dtype(DType::I64)?;
+        // [T, 16] → decoder format [1, 16, T]
+        let codes = Tensor::stack(&self.frame_buffer, 0)?
+            .t()?
+            .unsqueeze(0)?
+            .to_dtype(DType::I64)?;
         let audio = self
             .model
             .decoder
             .decode_with_state(&codes, &mut self.decoder_state)?;
-        let skip = context_frames * SAMPLES_PER_FRAME;
-        let audio = audio.narrow(2, skip, audio.dim(2)? - skip)?;
         AudioBuffer::from_tensor(audio, 24000)
     }
 
