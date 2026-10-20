@@ -1,11 +1,12 @@
 # Rust
 target/
-Cargo.lock
 
 # Node / Bun
 node_modules/
 *.lock
 !bun.lock
+!Cargo.lock
+!mlx-server/uv.lock
 
 # Data
 voice-recorder/data/
