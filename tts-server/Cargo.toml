@@ -38,7 +38,7 @@ hound = "3.5"
 tokio-stream = "0.1"
 
 # Candle (for Tensor/Device types in embedding module)
-candle-core = "0.9"
+candle-core = "0.11"
 
 # HTTP client (for benchmark binary)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

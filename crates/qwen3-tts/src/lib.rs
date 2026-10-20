@@ -2209,7 +2209,7 @@ mod tests {
     fn test_synthesis_options_default() {
         let options = SynthesisOptions::default();
         assert_eq!(options.max_length, 2048);
-        assert!((options.temperature - 0.9).abs() < 1e-6);
+        assert!((options.temperature - 0.7).abs() < 1e-6);
         assert_eq!(options.top_k, 50);
         assert!((options.top_p - 0.9).abs() < 1e-6);
         assert!((options.repetition_penalty - 1.05).abs() < 1e-6);
