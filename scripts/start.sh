@@ -4,14 +4,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Same resolution as voice-recorder/src/tts-bridge.ts: env, then .env, then platform.
+# Same resolution as voice-recorder/src/tts-bridge.ts: env, then .env, then rust.
 ENV_FILE="$PROJECT_ROOT/voice-recorder/.env"
 if [ -z "$TTS_BACKEND" ] && [ -f "$ENV_FILE" ]; then
   TTS_BACKEND="$(grep -E '^TTS_BACKEND=' "$ENV_FILE" | tail -1 | cut -d= -f2)"
 fi
-if [ -z "$TTS_BACKEND" ]; then
-  [ "$(uname -s)" = "Darwin" ] && TTS_BACKEND=mlx || TTS_BACKEND=rust
-fi
+TTS_BACKEND="${TTS_BACKEND:-rust}"
 
 echo "=== Qwen3-TTS Candle (backend: $TTS_BACKEND) ==="
 echo ""

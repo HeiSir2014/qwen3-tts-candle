@@ -11,15 +11,15 @@ const TTS_PORT = 5001;
 const TTS_URL = `http://127.0.0.1:${TTS_PORT}`;
 
 /**
- * "mlx" — mlx-server (Python, Apple Silicon); "rust" — tts-server (Candle).
- * Both speak the same HTTP + binary frame protocol; only mlx has preset voices.
+ * "rust" — tts-server (Candle, default); "mlx" — mlx-server (Python, Apple Silicon).
+ * Both speak the same HTTP + binary frame protocol, preset voices included.
  */
 export type TtsBackend = "mlx" | "rust";
 
 function resolveBackend(value: string | undefined): TtsBackend {
   if (value === "mlx" || value === "rust") return value;
   if (value) throw new Error(`Invalid TTS_BACKEND "${value}" (expected "mlx" or "rust")`);
-  return process.platform === "darwin" ? "mlx" : "rust";
+  return "rust";
 }
 
 export const TTS_BACKEND = resolveBackend(process.env.TTS_BACKEND);
@@ -125,9 +125,8 @@ export interface SystemVoice {
   description: string;
 }
 
-/** Preset CustomVoice speakers; only the mlx backend provides them. */
+/** Preset CustomVoice speakers; empty when the server has no CustomVoice model. */
 export async function fetchSystemVoices(): Promise<SystemVoice[]> {
-  if (TTS_BACKEND !== "mlx") return [];
   const res = await fetch(`${TTS_URL}/speakers`, { signal: AbortSignal.timeout(3000) });
   if (!res.ok) throw new Error(`TTS server error (${res.status})`);
   return (await res.json()) as SystemVoice[];
