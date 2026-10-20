@@ -81,6 +81,10 @@ name = "generate_audio"
 path = "src/bin/generate_audio.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "clone_stream_bench"
+required-features = ["hub"]
+
 [[bench]]
 name = "sampling"
 harness = false

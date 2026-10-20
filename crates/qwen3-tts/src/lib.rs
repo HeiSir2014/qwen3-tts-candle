@@ -1535,6 +1535,27 @@ const ICL_FRAMES_PER_TOKEN: usize = 6;
 /// ICL mode: minimum repetition penalty to prevent degenerate loops (matching mlx-audio)
 const ICL_MIN_REPETITION_PENALTY: f64 = 1.5;
 
+/// Per-phase wall-clock breakdown of a streaming session.
+///
+/// Collected only after [`StreamingSession::enable_profiling`]; each phase
+/// boundary forces a device sync, so profiled runs are slightly slower than
+/// unprofiled ones.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StreamingProfile {
+    /// Number of codec frames generated.
+    pub frames: usize,
+    /// Code predictor (15 acoustic codes) + residual embedding sum (ms).
+    pub code_predictor_ms: f64,
+    /// Talker decode step (ms).
+    pub talker_ms: f64,
+    /// Logit penalties + sampling + token readback (ms).
+    pub sampling_ms: f64,
+    /// Codec decoder (ms).
+    pub decode_ms: f64,
+    /// Number of decoder invocations (chunks).
+    pub decode_calls: usize,
+}
+
 /// Streaming synthesis session.
 ///
 /// Yields audio chunks as they are generated. Use with
@@ -1573,6 +1594,7 @@ pub struct StreamingSession<'a> {
     // Repetition detection: stop when the same semantic token repeats consecutively
     last_token: u32,
     repeat_count: usize,
+    profile: Option<StreamingProfile>,
 }
 
 impl<'a> StreamingSession<'a> {
@@ -1848,6 +1870,7 @@ impl<'a> StreamingSession<'a> {
             icl_ref_codes,
             last_token: first_token_id,
             repeat_count: 0,
+            profile: None,
         })
     }
 
@@ -1890,6 +1913,18 @@ impl<'a> StreamingSession<'a> {
         }
     }
 
+    /// Decode and clear the frame buffer, recording decoder time when profiling.
+    fn decode_buffered(&mut self) -> Result<AudioBuffer> {
+        let start = self.profile.is_some().then(Instant::now);
+        let audio = self.decode_frame_buffer(&self.frame_buffer)?;
+        self.frame_buffer.clear();
+        self.record_phase(start, |p| &mut p.decode_ms)?;
+        if let Some(profile) = self.profile.as_mut() {
+            profile.decode_calls += 1;
+        }
+        Ok(audio)
+    }
+
     /// Generate the next chunk of audio.
     ///
     /// Returns `Some(AudioBuffer)` for each chunk, or `None` when generation is complete.
@@ -1897,8 +1932,7 @@ impl<'a> StreamingSession<'a> {
         if self.done {
             // Flush remaining buffer
             if !self.frame_buffer.is_empty() {
-                let audio = self.decode_frame_buffer(&self.frame_buffer)?;
-                self.frame_buffer.clear();
+                let audio = self.decode_buffered()?;
                 return Ok(Some(audio));
             }
             return Ok(None);
@@ -1938,6 +1972,7 @@ impl<'a> StreamingSession<'a> {
                 self.repeat_count = 0;
             }
             self.last_token = token_id;
+            let phase_start = self.profile.is_some().then(Instant::now);
 
             // Embedding lookup using GPU-resident token tensor (no CPU→GPU roundtrip)
             let semantic_embed = self
@@ -1976,6 +2011,7 @@ impl<'a> StreamingSession<'a> {
                 self.tts_pad_embed.clone()
             };
             let step_input = summed.add(&text_addition)?;
+            let phase_start = self.record_phase(phase_start, |p| &mut p.code_predictor_ms)?;
 
             // Run talker step with fused embedding
             let (h, new_logits) = self.model.talker.generate_step_with_embed(
@@ -1985,6 +2021,7 @@ impl<'a> StreamingSession<'a> {
             )?;
             self.offset += 1;
             self.last_hidden = h;
+            let phase_start = self.record_phase(phase_start, |p| &mut p.talker_ms)?;
 
             // Sample next semantic token with repetition penalty + token suppression + min_new_tokens
             let logits_2d = new_logits.squeeze(1)?;
@@ -2004,6 +2041,10 @@ impl<'a> StreamingSession<'a> {
                 &self.scatter_ones,
             )?;
             self.token_count += 1;
+            self.record_phase(phase_start, |p| &mut p.sampling_ms)?;
+            if let Some(profile) = self.profile.as_mut() {
+                profile.frames += 1;
+            }
 
             if self.config.eos_token_id == Some(next_token_id) {
                 self.current_token = None;
@@ -2020,9 +2061,34 @@ impl<'a> StreamingSession<'a> {
             return Ok(None);
         }
 
-        let audio = self.decode_frame_buffer(&self.frame_buffer)?;
-        self.frame_buffer.clear();
+        let audio = self.decode_buffered()?;
         Ok(Some(audio))
+    }
+
+    /// Start collecting a per-phase [`StreamingProfile`] (adds device syncs).
+    pub fn enable_profiling(&mut self) {
+        self.profile = Some(StreamingProfile::default());
+    }
+
+    /// Per-phase breakdown, if profiling was enabled.
+    pub fn profile(&self) -> Option<&StreamingProfile> {
+        self.profile.as_ref()
+    }
+
+    /// When profiling, sync the device and add the time since `start` to the
+    /// selected phase. Returns the new phase start.
+    fn record_phase(
+        &mut self,
+        start: Option<Instant>,
+        phase: fn(&mut StreamingProfile) -> &mut f64,
+    ) -> Result<Option<Instant>> {
+        let (Some(start), Some(profile)) = (start, self.profile.as_mut()) else {
+            return Ok(None);
+        };
+        sync_device(&self.model.device)?;
+        let now = Instant::now();
+        *phase(profile) += now.duration_since(start).as_secs_f64() * 1000.0;
+        Ok(Some(now))
     }
 
     /// Returns the total number of frames generated so far.
