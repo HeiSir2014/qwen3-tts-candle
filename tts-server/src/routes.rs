@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use qwen3_tts::{AudioBuffer, Language, SynthesisOptions};
+use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, StreamingSession, SynthesisOptions};
 
 use crate::embedding::SerializablePrompt;
 use crate::state::AppState;
@@ -220,57 +220,221 @@ pub async fn clone_stream(
     };
 
     let text = req.text.clone();
-    let chunk_frames_val = req.chunk_frames.unwrap_or(10);
-    let state_clone = Arc::clone(&state);
-    let rid2 = rid.clone();
+    let options = SynthesisOptions {
+        chunk_frames: req.chunk_frames.unwrap_or(10),
+        ..sampling_options()
+    };
+    stream_response(
+        state,
+        rid,
+        start,
+        "clone_stream",
+        ModelKind::Base,
+        move |model| {
+            // Reconstruct VoiceClonePrompt from serializable data
+            let prompt = prompt_data
+                .to_prompt(model.device())
+                .map_err(|e| anyhow::anyhow!("Failed to reconstruct prompt: {}", e))?;
+            model.synthesize_voice_clone_streaming(&text, &prompt, language, options)
+        },
+    )
+}
 
+// ── GET /speakers ──
+
+/// Preset speakers of the CustomVoice model: (id, display name, description),
+/// descriptions from the official QwenLM/Qwen3-TTS README.
+const SPEAKERS: &[(&str, &str, &str)] = &[
+    (
+        "serena",
+        "Serena",
+        "Warm, gentle young female voice. (Chinese)",
+    ),
+    (
+        "vivian",
+        "Vivian",
+        "Bright, slightly edgy young female voice. (Chinese)",
+    ),
+    (
+        "uncle_fu",
+        "Uncle_Fu",
+        "Seasoned male voice with a low, mellow timbre. (Chinese)",
+    ),
+    (
+        "ryan",
+        "Ryan",
+        "Dynamic male voice with strong rhythmic drive. (English)",
+    ),
+    (
+        "aiden",
+        "Aiden",
+        "Sunny American male voice with a clear midrange. (English)",
+    ),
+    (
+        "ono_anna",
+        "Ono_Anna",
+        "Playful Japanese female voice with a light, nimble timbre. (Japanese)",
+    ),
+    (
+        "sohee",
+        "Sohee",
+        "Warm Korean female voice with rich emotion. (Korean)",
+    ),
+    (
+        "eric",
+        "Eric",
+        "Lively Chengdu male voice with a slightly husky brightness. (Sichuan dialect)",
+    ),
+    (
+        "dylan",
+        "Dylan",
+        "Youthful Beijing male voice with a clear, natural timbre. (Beijing dialect)",
+    ),
+];
+
+#[derive(Serialize)]
+pub struct SpeakerInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+pub async fn speakers(State(state): State<Arc<AppState>>) -> Json<Vec<SpeakerInfo>> {
+    if state.custom_voice.is_none() {
+        return Json(Vec::new());
+    }
+    Json(
+        SPEAKERS
+            .iter()
+            .map(|&(id, name, description)| SpeakerInfo {
+                id,
+                name,
+                description,
+            })
+            .collect(),
+    )
+}
+
+// ── POST /tts-stream ──
+
+#[derive(Deserialize)]
+pub struct TtsStreamRequest {
+    pub voice: String,
+    pub text: String,
+    pub language: Option<String>,
+}
+
+pub async fn tts_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TtsStreamRequest>,
+) -> Response {
+    let start = Instant::now();
+    let rid = request_id(&headers);
+    tracing::info!(
+        request_id = %rid,
+        voice = %req.voice,
+        text_len = req.text.len(),
+        "tts_stream_start"
+    );
+
+    if state.custom_voice.is_none() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "Preset voices are disabled (no CustomVoice model loaded)",
+        );
+    }
+    let speaker: Speaker = match req.voice.parse() {
+        Ok(s) => s,
+        Err(_) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                &format!("Unknown voice: {}", req.voice),
+            )
+        }
+    };
+    // "Auto" means the speaker's native language, as in the official CustomVoice demo.
+    let language = match req.language.as_deref() {
+        None | Some("") => speaker.native_language(),
+        Some(s) if s.eq_ignore_ascii_case("auto") => speaker.native_language(),
+        explicit => parse_language(explicit),
+    };
+
+    let text = req.text;
+    stream_response(
+        state,
+        rid,
+        start,
+        "tts_stream",
+        ModelKind::CustomVoice,
+        move |model| model.synthesize_streaming(&text, speaker, language, sampling_options()),
+    )
+}
+
+// ── Streaming generation ──
+
+#[derive(Clone, Copy)]
+enum ModelKind {
+    Base,
+    CustomVoice,
+}
+
+/// Sampling parameters shared by all streaming endpoints.
+fn sampling_options() -> SynthesisOptions {
+    SynthesisOptions {
+        temperature: 0.9,
+        top_k: 50,
+        top_p: 0.9,
+        repetition_penalty: 1.05,
+        ..Default::default()
+    }
+}
+
+/// Run a streaming session on a blocking thread and return its audio as a
+/// chunked binary-frame response. `make_session` runs with the model locked.
+fn stream_response<F>(
+    state: Arc<AppState>,
+    rid: String,
+    start: Instant,
+    label: &'static str,
+    kind: ModelKind,
+    make_session: F,
+) -> Response
+where
+    F: for<'a> FnOnce(&'a Qwen3TTS) -> anyhow::Result<StreamingSession<'a>> + Send + 'static,
+{
     // Channel for streaming binary frames to the HTTP response
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
 
     // Spawn the generation task
     tokio::task::spawn(async move {
-        state_clone.increment_queue().await;
+        state.increment_queue().await;
 
         let tx2 = tx.clone();
-        let rid3 = rid2.clone();
-        let state_for_blocking = Arc::clone(&state_clone);
+        let rid2 = rid.clone();
+        let state_for_blocking = Arc::clone(&state);
         let result = tokio::task::spawn_blocking(move || {
             // Lock the model for the duration of generation
-            let model = state_for_blocking.model.lock().unwrap();
-
-            // Reconstruct VoiceClonePrompt from serializable data
-            let device = model.device().clone();
-            let prompt = match prompt_data.to_prompt(&device) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx2.blocking_send(Ok(streaming::build_error_frame(
-                        &format!("Failed to reconstruct prompt: {}", e),
-                    )));
-                    return Err(e);
-                }
+            let mutex = match kind {
+                ModelKind::Base => &state_for_blocking.model,
+                ModelKind::CustomVoice => state_for_blocking
+                    .custom_voice
+                    .as_ref()
+                    .expect("custom voice model checked by handler"),
             };
+            let model = mutex.lock().unwrap();
 
-            // Use streaming API for true streaming generation
-            let options = SynthesisOptions {
-                temperature: 0.9,
-                top_k: 50,
-                top_p: 0.9,
-                repetition_penalty: 1.05,
-                chunk_frames: chunk_frames_val,
-                ..Default::default()
-            };
-
-            tracing::info!(request_id = %rid3, "Generation starting...");
+            tracing::info!(request_id = %rid2, "Generation starting...");
             let gen_start = Instant::now();
             let mut total_samples: usize = 0;
             let mut chunk_index: u32 = 0;
             let mut actual_sample_rate: u32 = 24000;
 
             // Use streaming session for true streaming
-            let mut session = match model.synthesize_voice_clone_streaming(&text, &prompt, language, options) {
+            let mut session = match make_session(&model) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!(request_id = %rid3, error = %e, "Failed to create streaming session");
+                    tracing::error!(request_id = %rid2, error = %e, "Failed to create streaming session");
                     let _ = tx2.blocking_send(Ok(streaming::build_error_frame(
                         &format!("Failed to create streaming session: {}", e),
                     )));
@@ -291,14 +455,14 @@ pub async fn clone_stream(
                         for chunk_data in pcm_bytes.chunks(STREAM_CHUNK_PCM_BYTES) {
                             let frame = streaming::build_audio_frame(chunk_index, sample_rate, chunk_data);
                             if tx2.blocking_send(Ok(frame)).is_err() {
-                                tracing::warn!(request_id = %rid3, chunk = chunk_index, "Client disconnected");
+                                tracing::warn!(request_id = %rid2, chunk = chunk_index, "Client disconnected");
                                 return Ok(());
                             }
                         }
                         chunk_index += 1;
                     }
                     Err(e) => {
-                        tracing::error!(request_id = %rid3, error = %e, "Streaming generation failed");
+                        tracing::error!(request_id = %rid2, error = %e, "Streaming generation failed");
                         let _ = tx2.blocking_send(Ok(streaming::build_error_frame(
                             &format!("Generation failed: {}", e),
                         )));
@@ -316,7 +480,7 @@ pub async fn clone_stream(
             };
 
             tracing::info!(
-                request_id = %rid3,
+                request_id = %rid2,
                 gen_ms = gen_ms,
                 audio_ms = audio_duration_ms,
                 rtf = format!("{:.2}", rtf),
@@ -333,26 +497,26 @@ pub async fn clone_stream(
         })
         .await;
 
-        state_clone.decrement_queue().await;
+        state.decrement_queue().await;
 
         match result {
             Ok(Ok(())) => {
                 tracing::info!(
-                    request_id = %rid2,
+                    request_id = %rid,
                     total_ms = start.elapsed().as_millis() as u64,
-                    "clone_stream_complete"
+                    "{}_complete", label
                 );
             }
             Ok(Err(e)) => {
                 tracing::error!(
-                    request_id = %rid2,
+                    request_id = %rid,
                     error = %e,
                     total_ms = start.elapsed().as_millis() as u64,
-                    "clone_stream_generation_failed"
+                    "{}_generation_failed", label
                 );
             }
             Err(e) => {
-                tracing::error!(request_id = %rid2, error = %e, "clone_stream_task_panicked");
+                tracing::error!(request_id = %rid, error = %e, "{}_task_panicked", label);
                 let _ = tx
                     .send(Ok(streaming::build_error_frame("Internal error")))
                     .await;

@@ -22,6 +22,11 @@ struct Args {
     #[arg(long, default_value = "Qwen/Qwen3-TTS-12Hz-0.6B-Base")]
     model_path: String,
 
+    /// CustomVoice model serving the preset speakers (local path or
+    /// HuggingFace model ID). Pass an empty string to disable them.
+    #[arg(long, default_value = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")]
+    custom_voice_model: String,
+
     /// Device to use: auto, cpu, cuda, cuda:N, metal.
     #[arg(long, default_value = "auto")]
     device: String,
@@ -63,10 +68,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("Qwen3-TTS Server starting...");
-    tracing::info!(model = %args.model_path, device = %args.device, port = args.port, log_dir = %args.log_dir);
+    tracing::info!(model = %args.model_path, custom_voice_model = %args.custom_voice_model, device = %args.device, port = args.port, log_dir = %args.log_dir);
 
     // Load model (this can take a while)
-    let state = Arc::new(state::AppState::new(&args.model_path, &args.device)?);
+    let state = Arc::new(state::AppState::new(
+        &args.model_path,
+        Some(args.custom_voice_model.as_str()).filter(|p| !p.is_empty()),
+        &args.device,
+    )?);
 
     // Build router
     let app = server::build_router(state);
