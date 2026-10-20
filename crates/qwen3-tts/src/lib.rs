@@ -437,8 +437,9 @@ impl Qwen3TTS {
         let input_ids = self.text_tokenizer.encode(text)?;
         let gen_config = options.to_gen_config();
 
-        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
-            self.build_trailing_text(&input_ids)?;
+        // The whole text goes into the prefill; generation only adds tts_pad.
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len) = (tts_pad_embed.clone(), 0);
 
         // -- Prefill --
         #[cfg(feature = "profiling")]
@@ -449,8 +450,12 @@ impl Qwen3TTS {
 
         let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) =
-            self.talker
-                .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
+            self.talker.prefill_custom_voice_non_streaming(
+                &input_ids,
+                speaker,
+                language,
+                &mut kv_caches,
+            )?;
         let prefill_len = hidden.dim(1)?;
         let offset = prefill_len;
         let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
@@ -779,8 +784,9 @@ impl Qwen3TTS {
 
         let gen_config = options.to_gen_config();
 
-        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
-            self.build_trailing_text(&input_ids)?;
+        // The whole text goes into the prefill; generation only adds tts_pad.
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len) = (tts_pad_embed.clone(), 0);
 
         // Prefill with CustomVoice format
         #[cfg(feature = "profiling")]
@@ -788,8 +794,12 @@ impl Qwen3TTS {
 
         let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) =
-            self.talker
-                .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
+            self.talker.prefill_custom_voice_non_streaming(
+                &input_ids,
+                speaker,
+                language,
+                &mut kv_caches,
+            )?;
         let prefill_len = hidden.dim(1)?;
         let offset = prefill_len;
         let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
@@ -1628,14 +1638,17 @@ impl<'a> StreamingSession<'a> {
         let sampling_ctx = generation::SamplingContext::new(options.seed);
         let config = options.to_gen_config();
 
-        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
-            model.build_trailing_text(input_ids)?;
+        // The whole text goes into the prefill; generation only adds tts_pad.
+        let tts_pad_embed = model.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len) = (tts_pad_embed.clone(), 0);
 
         let mut kv_caches = model.talker.new_kv_caches(config.max_new_tokens + 256);
-        let prefill_result =
-            model
-                .talker
-                .prefill_custom_voice(input_ids, speaker, language, &mut kv_caches)?;
+        let prefill_result = model.talker.prefill_custom_voice_non_streaming(
+            input_ids,
+            speaker,
+            language,
+            &mut kv_caches,
+        )?;
         let (offset, last_hidden, logits) = Self::unpack_prefill(&prefill_result)?;
 
         Self::from_prefill(

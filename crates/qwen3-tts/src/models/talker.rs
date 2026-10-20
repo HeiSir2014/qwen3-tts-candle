@@ -156,6 +156,18 @@ impl Speaker {
         }
     }
 
+    /// Codec language token for this speaker: dialect speakers use their
+    /// dialect id in place of Chinese (config `spk_is_dialect`).
+    pub fn language_token_id(&self, language: Language) -> u32 {
+        const SICHUAN_DIALECT: u32 = 2062;
+        const BEIJING_DIALECT: u32 = 2074;
+        match (self, language) {
+            (Speaker::Eric, Language::Chinese) => SICHUAN_DIALECT,
+            (Speaker::Dylan, Language::Chinese) => BEIJING_DIALECT,
+            _ => language.token_id(),
+        }
+    }
+
     /// Get the native language for this speaker
     pub fn native_language(&self) -> Language {
         match self {
@@ -533,18 +545,66 @@ impl TalkerModel {
         language: Language,
         icl_mode: bool,
     ) -> Result<Tensor> {
+        let (mut hidden, codec_bos_embed) =
+            self.speaker_prefix(speaker_embed, language.token_id())?;
+
+        // First text token + codec_bos (skipped in ICL mode)
+        if !icl_mode {
+            if let Some(combined) = self.build_first_text_combined(text_tokens, &codec_bos_embed)? {
+                hidden = Tensor::cat(&[&hidden, &combined], 1)?;
+            }
+        }
+
+        Ok(hidden)
+    }
+
+    /// Prefill for CustomVoice with the whole text in the prompt
+    /// ("non-streaming text input", the default of the official
+    /// `generate_custom_voice` and of mlx-audio).
+    ///
+    /// Same speaker/language prefix as [`Self::prefill_custom_voice`] up to
+    /// `tts_bos + codec_pad`, followed by every text token and `tts_eos`, each
+    /// added to `codec_pad`, and finally `tts_pad + codec_bos`. Generation
+    /// then adds only `tts_pad` (no trailing text). Dialect speakers get
+    /// their dialect language id for Chinese.
+    pub fn prefill_custom_voice_non_streaming(
+        &self,
+        text_tokens: &[u32],
+        speaker: Speaker,
+        language: Language,
+        kv_caches: &mut [AnyKVCache],
+    ) -> Result<(Tensor, Tensor)> {
+        use codec_tokens::*;
+
+        let speaker_embed = self.get_codec_embedding(speaker.token_id())?;
+        let (prefix, codec_bos_embed) =
+            self.speaker_prefix(&speaker_embed, speaker.language_token_id(language))?;
+
+        let text = Tensor::cat(
+            &[
+                &self.get_projected_text_embeddings(text_tokens)?,
+                &self.get_tts_eos_embed()?,
+            ],
+            1,
+        )?;
+        let text = text.broadcast_add(&self.get_codec_embedding(CODEC_PAD)?)?;
+        let start = self.get_tts_pad_embed()?.add(&codec_bos_embed)?;
+
+        let hidden = Tensor::cat(&[&prefix, &text, &start], 1)?;
+        self.run_prefill_layers(hidden, kv_caches)
+    }
+
+    /// Role prefix plus `[tts_pad × 5, tts_bos]` overlaid on
+    /// `[think, think_bos, language, think_eos, speaker, pad]` (9 positions).
+    /// Also returns the `codec_bos` embedding that the caller places next.
+    fn speaker_prefix(&self, speaker_embed: &Tensor, language_id: u32) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
 
         let role_prefix_hidden = self.build_role_prefix()?;
 
         // Codec: [think, think_bos, lang, think_eos] + speaker_embed + [pad, bos]
         let codec_prefix_ids = Tensor::new(
-            &[
-                CODEC_THINK,
-                CODEC_THINK_BOS,
-                language.token_id(),
-                CODEC_THINK_EOS,
-            ],
+            &[CODEC_THINK, CODEC_THINK_BOS, language_id, CODEC_THINK_EOS],
             &self.device,
         )?;
         let codec_prefix_embed = self
@@ -567,17 +627,8 @@ impl TalkerModel {
         let codec_first6 = codec_embed.i((.., ..6, ..))?;
         let codec_hidden = tts_text_embed.add(&codec_first6)?;
 
-        let mut hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?;
-
-        // First text token + codec_bos (skipped in ICL mode)
-        if !icl_mode {
-            let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
-            if let Some(combined) = self.build_first_text_combined(text_tokens, &codec_bos_embed)? {
-                hidden = Tensor::cat(&[&hidden, &combined], 1)?;
-            }
-        }
-
-        Ok(hidden)
+        let hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?;
+        Ok((hidden, codec_embed.i((.., 6..7, ..))?))
     }
 
     /// Prefill for VoiceDesign model with text-described voice conditioning.
@@ -1037,6 +1088,15 @@ mod tests {
     fn test_language_token_ids() {
         assert_eq!(Language::English.token_id(), 2050);
         assert_eq!(Language::Chinese.token_id(), 2055);
+    }
+
+    #[test]
+    fn test_speaker_dialect_language_ids() {
+        // config.json: spk_is_dialect eric=sichuan_dialect, dylan=beijing_dialect
+        assert_eq!(Speaker::Eric.language_token_id(Language::Chinese), 2062);
+        assert_eq!(Speaker::Dylan.language_token_id(Language::Chinese), 2074);
+        assert_eq!(Speaker::Eric.language_token_id(Language::English), 2050);
+        assert_eq!(Speaker::Serena.language_token_id(Language::Chinese), 2055);
     }
 
     #[test]
