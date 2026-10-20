@@ -567,6 +567,11 @@ impl Qwen3TTS {
         let _gen_span = tracing::info_span!("generate_frames").entered();
 
         for frame_idx in 0..gen_config.max_new_tokens {
+            // Stop at end of speech; the EOS token itself is not a frame.
+            if gen_config.eos_token_id == Some(semantic_token) {
+                break;
+            }
+
             // Stop on repetition (model stuck in loop)
             if semantic_token == last_token {
                 repeat_count += 1;
