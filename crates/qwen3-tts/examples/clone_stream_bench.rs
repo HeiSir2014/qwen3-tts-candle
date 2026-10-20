@@ -104,7 +104,10 @@ fn main() -> Result<()> {
     let ref_audio = AudioBuffer::load(&ref_audio_path)?;
 
     for (label, text) in CORPUS {
-        if labels.as_ref().is_some_and(|l| !l.iter().any(|x| x == label)) {
+        if labels
+            .as_ref()
+            .is_some_and(|l| !l.iter().any(|x| x == label))
+        {
             continue;
         }
         for _ in 0..WARMUP {

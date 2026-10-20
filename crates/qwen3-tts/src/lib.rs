@@ -97,7 +97,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use models::codec::{Decoder12Hz, Encoder12Hz};
+use models::codec::{Decoder12Hz, DecoderStreamState, Encoder12Hz};
 use models::speaker::SpeakerEncoder;
 use models::AnyKVCache;
 
@@ -1527,6 +1527,10 @@ pub const CODEC_EOS_TOKEN_ID: u32 = codec_tokens::CODEC_EOS;
 /// Number of audio samples per codec frame at 24kHz (1920 = 80ms per frame at 12Hz).
 pub const SAMPLES_PER_FRAME: usize = 1920;
 
+/// ICL mode: reference frames decoded as left context before the first
+/// streaming chunk (the reference implementation's `left_context_size`).
+const ICL_DECODER_CONTEXT_FRAMES: usize = 25;
+
 /// ICL mode: minimum frames to generate regardless of text length (matching mlx-audio)
 const ICL_MIN_FRAMES: usize = 75;
 
@@ -1609,10 +1613,12 @@ pub struct StreamingSession<'a> {
     // Pre-allocated code predictor KV caches (reused + reset each frame)
     cp_kv_caches: Vec<AnyKVCache>,
     // ICL reference codes for decoder context (voice cloning only).
-    // When present, ref_codes are prepended to each chunk before decoding
-    // and the corresponding audio prefix is trimmed from the output.
-    // Stored as a GPU tensor [T_ref, 16] to avoid CPU roundtrips.
+    // The tail of ref_codes is prepended to the first chunk so the decoder
+    // starts from the reference voice; its audio is trimmed from the output.
+    // Taken (None) once the first chunk is decoded. GPU tensor [T_ref, 16].
     icl_ref_codes: Option<Tensor>,
+    // Incremental decoder state: each chunk only decodes its new frames.
+    decoder_state: DecoderStreamState,
     // Repetition detection: stop when the same semantic token repeats consecutively
     last_token: u32,
     repeat_count: usize,
@@ -1777,9 +1783,8 @@ impl<'a> StreamingSession<'a> {
                 logits = model.talker.apply_codec_head(&last_icl_hidden)?;
                 last_hidden = last_icl_hidden;
 
-                // Store ref_codes tensor directly for decoder context: each chunk
-                // will prepend these frames and trim the corresponding audio prefix.
-                // Keeping as GPU tensor avoids per-frame CPU roundtrips.
+                // Store ref_codes tensor directly as decoder context for the
+                // first chunk. Keeping as GPU tensor avoids CPU roundtrips.
                 icl_ref_codes = Some(ref_codes.to_dtype(DType::U32)?);
 
                 icl_trailing
@@ -1870,55 +1875,46 @@ impl<'a> StreamingSession<'a> {
             token_count: 1,
             cp_kv_caches,
             icl_ref_codes,
+            decoder_state: DecoderStreamState::default(),
             last_token: first_token_id,
             repeat_count: 0,
             profile: None,
         })
     }
 
-    /// Convert GPU frame tensors to the decoder's expected [1, 16, T] layout.
+    /// Incrementally decode buffered frames to audio.
     ///
-    /// Each frame is a [16] U32 tensor on GPU. We stack → [T, 16], transpose
-    /// → [16, T], unsqueeze → [1, 16, T], and cast to I64 for the decoder.
-    /// This stays entirely on GPU, avoiding the CPU transposition in `codes_to_tensor`.
-    fn gpu_frames_to_decoder_input(frames: &[Tensor]) -> Result<Tensor> {
-        let stacked = Tensor::stack(frames, 0)?; // [T, 16]
-        Ok(stacked.t()?.unsqueeze(0)?.to_dtype(DType::I64)?)
-    }
+    /// All frame data stays on GPU. On the first chunk of an ICL session the
+    /// last [`ICL_DECODER_CONTEXT_FRAMES`] reference frames are decoded in
+    /// front of the generated ones (as the reference implementation's
+    /// left-context decoding does) and their audio is trimmed.
+    fn decode_frame_buffer(&mut self) -> Result<AudioBuffer> {
+        let generated = Tensor::stack(&self.frame_buffer, 0)?; // [T_gen, 16]
+        let (codes, context_frames) = match self.icl_ref_codes.take() {
+            Some(ref_codes) => {
+                let ref_len = ref_codes.dim(0)?;
+                let context = ref_len.min(ICL_DECODER_CONTEXT_FRAMES);
+                let context_codes = ref_codes.narrow(0, ref_len - context, context)?;
+                (Tensor::cat(&[&context_codes, &generated], 0)?, context)
+            }
+            None => (generated, 0),
+        };
 
-    /// Decode buffered frames to audio, applying ICL ref_codes context if present.
-    ///
-    /// All frame data stays on GPU — no CPU roundtrips. When `icl_ref_codes` is
-    /// set, the reference frames are prepended before decoding and the
-    /// corresponding audio prefix is proportionally trimmed.
-    fn decode_frame_buffer(&self, frames: &[Tensor]) -> Result<AudioBuffer> {
-        if let Some(ref ref_codes_tensor) = self.icl_ref_codes {
-            // ref_codes_tensor is [T_ref, 16] on GPU; frames are Vec<[16]> on GPU
-            let gen_stacked = Tensor::stack(frames, 0)?; // [T_gen, 16]
-            let combined = Tensor::cat(&[ref_codes_tensor, &gen_stacked], 0)?; // [T_total, 16]
-            let ref_len = ref_codes_tensor.dim(0)?;
-            let total_len = combined.dim(0)?;
-
-            // Transpose to decoder format: [1, 16, T]
-            let codes = combined.t()?.unsqueeze(0)?.to_dtype(DType::I64)?;
-            let mut audio =
-                AudioBuffer::from_tensor(self.model.decoder.decode(&codes)?, 24000)?;
-
-            // Proportional cut matching Python reference implementation
-            let cut_samples = ref_len * audio.samples.len() / total_len.max(1);
-            audio.samples = audio.samples[cut_samples.min(audio.samples.len())..].to_vec();
-            Ok(audio)
-        } else {
-            let codes = Self::gpu_frames_to_decoder_input(frames)?;
-            let audio = self.model.decoder.decode(&codes)?;
-            AudioBuffer::from_tensor(audio, 24000)
-        }
+        // Decoder format: [1, 16, T]
+        let codes = codes.t()?.unsqueeze(0)?.to_dtype(DType::I64)?;
+        let audio = self
+            .model
+            .decoder
+            .decode_with_state(&codes, &mut self.decoder_state)?;
+        let skip = context_frames * SAMPLES_PER_FRAME;
+        let audio = audio.narrow(2, skip, audio.dim(2)? - skip)?;
+        AudioBuffer::from_tensor(audio, 24000)
     }
 
     /// Decode and clear the frame buffer, recording decoder time when profiling.
     fn decode_buffered(&mut self) -> Result<AudioBuffer> {
         let start = self.profile.is_some().then(Instant::now);
-        let audio = self.decode_frame_buffer(&self.frame_buffer)?;
+        let audio = self.decode_frame_buffer()?;
         self.frame_buffer.clear();
         self.record_phase(start, |p| &mut p.decode_ms)?;
         if let Some(profile) = self.profile.as_mut() {

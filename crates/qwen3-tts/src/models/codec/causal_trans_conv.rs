@@ -86,17 +86,37 @@ impl CausalTransConv1d {
     /// Input shape: [batch, in_channels, seq_len]
     /// Output shape: [batch, out_channels, seq_len * stride]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_state(x, &mut None)
+    }
+
+    /// Streaming forward. The `right_trim` tail of each call overlaps the
+    /// first outputs of the next call; it is kept (without bias) in
+    /// `overflow` and added to the next call's head, so chunked calls
+    /// reproduce one [`Self::forward`] over the whole sequence.
+    pub fn forward_with_state(&self, x: &Tensor, overflow: &mut Option<Tensor>) -> Result<Tensor> {
         // Apply transposed convolution
         let out = self.conv.forward(x)?;
-
-        // Trim output for causality
-        let out_len = out.dim(2)?;
-        if self.right_trim > 0 {
-            let end = out_len.saturating_sub(self.right_trim);
-            Ok(out.narrow(2, 0, end)?)
-        } else {
-            Ok(out)
+        if self.right_trim == 0 {
+            return Ok(out);
         }
+
+        // Trim output for causality, carrying the trimmed tail forward
+        let valid = out.dim(2)? - self.right_trim;
+        let tail = out.narrow(2, valid, self.right_trim)?;
+        let tail = match self.conv.bias() {
+            Some(bias) => tail.broadcast_sub(&bias.reshape((1, (), 1))?)?,
+            None => tail.contiguous()?,
+        };
+        let head = out.narrow(2, 0, valid)?;
+        let head = match overflow.replace(tail) {
+            Some(prev) => {
+                let overlap = (head.narrow(2, 0, self.right_trim)? + prev)?;
+                let rest = head.narrow(2, self.right_trim, valid - self.right_trim)?;
+                Tensor::cat(&[&overlap, &rest], 2)?
+            }
+            None => head,
+        };
+        Ok(head)
     }
 
     /// Get the stride (upsampling factor)
@@ -138,6 +158,38 @@ mod tests {
         // Output: raw = (10-1)*2 + 4 = 22, trim 2 from right -> 20 = 10 * 2
         // This gives exact input * stride upsampling
         assert_eq!(output.dims(), &[1, 32, 20]);
+    }
+
+    #[test]
+    fn test_causal_trans_conv_streaming_matches_full() {
+        let device = Device::Cpu;
+        let weight = Tensor::randn(0.0f32, 0.1, (16, 8, 10), &device).unwrap();
+        let bias = Tensor::randn(0.0f32, 0.1, (8,), &device).unwrap();
+        let conv = CausalTransConv1d::from_weights(weight, Some(bias), 5).unwrap();
+
+        let input = Tensor::randn(0.0f32, 1.0, (1, 16, 9), &device).unwrap();
+        let full = conv.forward(&input).unwrap();
+
+        let mut overflow = None;
+        let chunks: Vec<Tensor> = [(0, 4), (4, 1), (5, 4)]
+            .iter()
+            .map(|&(start, len)| {
+                conv.forward_with_state(&input.narrow(2, start, len).unwrap(), &mut overflow)
+                    .unwrap()
+            })
+            .collect();
+        let streamed = Tensor::cat(&chunks, 2).unwrap();
+        let diff: f32 = (&full - &streamed)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff < 1e-5, "max diff {diff}");
     }
 
     #[test]

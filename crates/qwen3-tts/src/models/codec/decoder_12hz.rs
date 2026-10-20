@@ -7,6 +7,8 @@ use anyhow::Result;
 use candle_core::{DType, IndexOp, Tensor, D};
 use std::collections::HashMap;
 
+use super::causal_conv::CausalConvState;
+use super::decoder_block::DecoderBlockState;
 use super::{CausalConv1d, CausalTransConv1d, ConvNeXtBlock, DecoderBlock, SnakeBeta};
 
 /// Configuration for the 12Hz decoder
@@ -112,8 +114,44 @@ impl UpsampleStage {
 
     /// Forward pass
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let hidden = self.trans_conv.forward(x)?;
-        self.convnext.forward(&hidden)
+        self.forward_with_state(x, &mut UpsampleStageState::default())
+    }
+
+    /// Streaming forward (see [`CausalConv1d::forward_with_state`]).
+    pub fn forward_with_state(&self, x: &Tensor, state: &mut UpsampleStageState) -> Result<Tensor> {
+        let hidden = self
+            .trans_conv
+            .forward_with_state(x, &mut state.trans_conv_overflow)?;
+        self.convnext.forward_with_state(&hidden, &mut state.dwconv)
+    }
+}
+
+/// Streaming state of an [`UpsampleStage`].
+#[derive(Default)]
+pub struct UpsampleStageState {
+    trans_conv_overflow: Option<Tensor>,
+    dwconv: CausalConvState,
+}
+
+/// Incremental decoding state for [`Decoder12Hz::decode_with_state`]: conv
+/// left contexts, transposed-conv overlaps and the transformer KV cache.
+#[derive(Default)]
+pub struct DecoderStreamState {
+    /// Number of frames decoded so far (transformer position offset).
+    frames: usize,
+    pre_conv: CausalConvState,
+    /// Per-layer transformer `(k, v)`, each `[batch, heads, frames, head_dim]`.
+    kv: Vec<(Tensor, Tensor)>,
+    upsample: Vec<UpsampleStageState>,
+    decoder_init_conv: CausalConvState,
+    blocks: Vec<DecoderBlockState>,
+    final_conv: CausalConvState,
+}
+
+impl DecoderStreamState {
+    /// Number of frames decoded so far.
+    pub fn frames(&self) -> usize {
+        self.frames
     }
 }
 
@@ -409,6 +447,25 @@ impl Decoder12Hz {
     /// # Returns
     /// Audio tensor of shape [batch, 1, samples]
     pub fn decode(&self, codes: &Tensor) -> Result<Tensor> {
+        self.decode_with_state(codes, &mut DecoderStreamState::default())
+    }
+
+    /// Incrementally decode the next codes of a stream.
+    ///
+    /// Feeding a code sequence in consecutive chunks with one `state` yields
+    /// the same audio as a single [`Self::decode`] of the whole sequence,
+    /// while each call only costs the new frames.
+    ///
+    /// # Arguments
+    /// * `codes` - New token indices of shape [batch, num_quantizers, new_len]
+    ///
+    /// # Returns
+    /// Audio for the new frames, shape [batch, 1, new_len * total_upsample]
+    pub fn decode_with_state(
+        &self,
+        codes: &Tensor,
+        state: &mut DecoderStreamState,
+    ) -> Result<Tensor> {
         let device = codes.device();
         let (batch_size, _num_quantizers, seq_len) = codes.dims3()?;
 
@@ -454,7 +511,9 @@ impl Decoder12Hz {
 
         // 2. Pre-conv
         // quantized is already [batch, 512, seq] from projections
-        let hidden = self.pre_conv.forward(&quantized)?; // [batch, 1024, seq]
+        let hidden = self
+            .pre_conv
+            .forward_with_state(&quantized, &mut state.pre_conv)?; // [batch, 1024, seq]
 
         // 3. Pre-transformer
         let hidden = hidden.transpose(1, 2)?; // [batch, seq, 1024]
@@ -465,7 +524,7 @@ impl Decoder12Hz {
         )?;
 
         // Run transformer layers
-        let hidden = self.run_transformer(hidden, seq_len)?;
+        let hidden = self.run_transformer(hidden, seq_len, state)?;
 
         // Final norm before output projection
         let hidden = self.rms_norm(&hidden, &self.final_norm_weight)?;
@@ -481,23 +540,34 @@ impl Decoder12Hz {
         let mut hidden = hidden.transpose(1, 2)?;
 
         // 5. Upsample stages
-        for stage in self.upsample_stages.iter() {
-            hidden = stage.forward(&hidden)?;
+        state
+            .upsample
+            .resize_with(self.upsample_stages.len(), Default::default);
+        for (stage, stage_state) in self.upsample_stages.iter().zip(&mut state.upsample) {
+            hidden = stage.forward_with_state(&hidden, stage_state)?;
         }
 
         // 6. Decoder.0 (initial conv)
-        hidden = self.decoder_init_conv.forward(&hidden)?;
+        hidden = self
+            .decoder_init_conv
+            .forward_with_state(&hidden, &mut state.decoder_init_conv)?;
 
         // 7. Decoder blocks
-        for block in self.decoder_blocks.iter() {
-            hidden = block.forward(&hidden)?;
+        state
+            .blocks
+            .resize_with(self.decoder_blocks.len(), Default::default);
+        for (block, block_state) in self.decoder_blocks.iter().zip(&mut state.blocks) {
+            hidden = block.forward_with_state(&hidden, block_state)?;
         }
 
         // 8. Final SnakeBeta
         hidden = self.final_snake.forward(&hidden)?;
 
         // 9. Final conv
-        hidden = self.final_conv.forward(&hidden)?;
+        hidden = self
+            .final_conv
+            .forward_with_state(&hidden, &mut state.final_conv)?;
+        state.frames += seq_len;
 
         // 10. Clamp to [-1, 1] per official implementation
         // The decoder outputs values in a large range (e.g., [-27, 27])
@@ -534,12 +604,19 @@ impl Decoder12Hz {
     }
 
     /// Run transformer layers
-    fn run_transformer(&self, mut hidden: Tensor, seq_len: usize) -> Result<Tensor> {
+    fn run_transformer(
+        &self,
+        mut hidden: Tensor,
+        seq_len: usize,
+        state: &mut DecoderStreamState,
+    ) -> Result<Tensor> {
         let device = hidden.device();
         let (batch_size, _, _) = hidden.dims3()?;
+        let offset = state.frames;
+        let total_len = offset + seq_len;
 
         // Build RoPE embeddings
-        let positions = Tensor::arange(0u32, seq_len as u32, device)?;
+        let positions = Tensor::arange(offset as u32, total_len as u32, device)?;
         let inv_freq_vals: Vec<f32> = (0..self.config.head_dim)
             .step_by(2)
             .map(|i| {
@@ -555,28 +632,32 @@ impl Decoder12Hz {
         let cos = cos.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, seq, head_dim]
         let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
 
-        // Causal mask - create upper triangular mask with -inf
-        let mut mask_data = vec![0.0f32; seq_len * seq_len];
+        // Causal mask over [cached + new] keys: query i sits at offset + i
+        let mut mask_data = vec![0.0f32; seq_len * total_len];
         for i in 0..seq_len {
-            for j in (i + 1)..seq_len {
-                mask_data[i * seq_len + j] = f32::NEG_INFINITY;
+            for j in (offset + i + 1)..total_len {
+                mask_data[i * total_len + j] = f32::NEG_INFINITY;
             }
         }
-        let causal_mask = Tensor::from_vec(mask_data, (seq_len, seq_len), device)?
+        let causal_mask = Tensor::from_vec(mask_data, (seq_len, total_len), device)?
             .unsqueeze(0)?
             .unsqueeze(0)?;
 
+        let mut kv = std::mem::take(&mut state.kv).into_iter();
         for (layer_idx, layer) in self.transformer_weights.layers.iter().enumerate() {
-            hidden = self.run_layer(
+            let (out, layer_kv) = self.run_layer(
                 &hidden,
                 layer,
                 &cos,
                 &sin,
                 &causal_mask,
+                kv.next(),
                 batch_size,
                 seq_len,
                 layer_idx,
             )?;
+            hidden = out;
+            state.kv.push(layer_kv);
         }
 
         Ok(hidden)
@@ -591,10 +672,11 @@ impl Decoder12Hz {
         cos: &Tensor,
         sin: &Tensor,
         causal_mask: &Tensor,
+        cache: Option<(Tensor, Tensor)>,
         batch_size: usize,
         seq_len: usize,
         layer_idx: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, (Tensor, Tensor))> {
         // RMS Norm
         let normed = self.rms_norm(hidden, &layer.input_ln_weight)?;
 
@@ -636,6 +718,13 @@ impl Decoder12Hz {
         // Attention
         let scale = (self.config.head_dim as f64).powf(-0.5);
         let q = q.contiguous()?;
+        let (k, v) = match cache {
+            Some((k_prev, v_prev)) => (
+                Tensor::cat(&[&k_prev, &k], 2)?,
+                Tensor::cat(&[&v_prev, &v], 2)?,
+            ),
+            None => (k, v),
+        };
         let k = k.contiguous()?;
         let v = v.contiguous()?;
         let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
@@ -669,7 +758,7 @@ impl Decoder12Hz {
         let mlp_out = mlp_out.broadcast_mul(&layer.mlp_layer_scale)?;
         let hidden = (hidden + mlp_out)?;
 
-        Ok(hidden)
+        Ok((hidden, (k, v)))
     }
 
     /// RMS normalization
