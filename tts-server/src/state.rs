@@ -6,7 +6,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use candle_core::Device;
-use qwen3_tts::{auto_device, device_info, Language, ModelPaths, Qwen3TTS, Speaker};
+use qwen3_tts::{
+    auto_device, device_info, AudioBuffer, Language, ModelPaths, Qwen3TTS, Speaker,
+    SynthesisOptions,
+};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::embedding::SerializablePrompt;
@@ -56,7 +59,15 @@ impl AppState {
         // so the first real request doesn't pay the compilation cost.
         tracing::info!("Warming up model (short synthesis)...");
         match model.synthesize("warmup", None) {
-            Ok(_) => tracing::info!("Warmup complete"),
+            Ok(audio) => {
+                tracing::info!("Warmup complete");
+                if model.supports_voice_cloning() {
+                    match warm_up_clone(&model, &audio) {
+                        Ok(()) => tracing::info!("Voice clone warmup complete"),
+                        Err(e) => tracing::warn!("Voice clone warmup failed (non-fatal): {}", e),
+                    }
+                }
+            }
             Err(e) => tracing::warn!("Warmup synthesis failed (non-fatal): {}", e),
         }
 
@@ -117,6 +128,22 @@ impl AppState {
     pub async fn get_queue_size(&self) -> u32 {
         *self.queue_size.lock().await
     }
+}
+
+/// Run the /clone-stream path once (prompt extraction + first streamed chunk)
+/// so the first real request doesn't pay its kernel compilation: the plain
+/// warmup synthesis never touches the speaker/speech encoders or the ICL
+/// decoder priming. `reference` is the warmup synthesis output.
+fn warm_up_clone(model: &Qwen3TTS, reference: &AudioBuffer) -> Result<()> {
+    let prompt = model.create_voice_clone_prompt(reference, Some("warmup"))?;
+    let mut session = model.synthesize_voice_clone_streaming(
+        "warmup",
+        &prompt,
+        Language::Chinese,
+        SynthesisOptions::default(),
+    )?;
+    session.next().transpose()?;
+    Ok(())
 }
 
 /// Load a model from a local weights directory or a HuggingFace model ID.
