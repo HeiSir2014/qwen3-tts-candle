@@ -375,6 +375,28 @@ fn top_p_filter(logits: &Tensor, p: f64) -> Result<Tensor> {
 fn multinomial_sample(probs: &Tensor, ctx: &mut SamplingContext) -> Result<Tensor> {
     let (batch, vocab) = probs.dims2()?;
 
+    if probs.device().is_cpu() {
+        // CPU path: linear scan. candle's `cumsum` is a matmul with a
+        // [vocab, vocab] triangular matrix, which dominates sampling time.
+        let rows: Vec<Vec<f32>> = probs.to_vec2()?;
+        let tokens: Vec<u32> = rows
+            .iter()
+            .map(|row| {
+                let u = ctx.rand_f32();
+                let mut cumsum = 0.0f32;
+                row.iter()
+                    .position(|&p| {
+                        cumsum += p;
+                        cumsum >= u
+                    })
+                    // Rounding can leave the total just below `u`.
+                    .or_else(|| row.iter().rposition(|&p| p > 0.0))
+                    .unwrap_or(0) as u32
+            })
+            .collect();
+        return Ok(Tensor::new(tokens.as_slice(), probs.device())?);
+    }
+
     // Cumulative distribution for sampling
     let cumsum = probs.cumsum(1)?;
 

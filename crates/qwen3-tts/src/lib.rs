@@ -539,37 +539,14 @@ impl Qwen3TTS {
         trailing_text_len: usize,
         tts_pad_embed: &Tensor,
     ) -> Result<FrameCodes> {
-        // Pre-build the token suppression mask once (reused every frame)
-        let suppression_mask = generation::build_suppression_mask(
-            codec_tokens::CODEC_VOCAB_SIZE,
-            CODEC_EOS_TOKEN_ID,
-            &self.device,
-        )?;
-
-        // GPU-side repetition penalty mask: [1, vocab] — updated incrementally
-        // instead of transferring all generated tokens to CPU each frame.
-        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
-        let mut penalty_mask = Tensor::zeros((1, vocab_size), DType::F32, &self.device)?;
-
-        // Pre-allocate small tensors reused every frame
-        let scatter_ones = Tensor::ones((1, 1), DType::F32, &self.device)?;
+        let mut sampler = SemanticSampler::new()?;
 
         // Pre-allocate code predictor KV caches (reused + reset each frame)
         let mut cp_kv_caches = self.code_predictor.new_kv_caches();
 
         // Sample first semantic token
-        let logits_2d = initial_logits.squeeze(1)?;
-        let logits_2d = self.apply_generation_penalties_gpu(
-            &logits_2d,
-            &penalty_mask,
-            gen_config,
-            0,
-            Some(&suppression_mask),
-        )?;
-        let mut semantic_token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
-        let mut semantic_token: u32 = semantic_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
-        // Update penalty mask using GPU scatter (no per-frame tensor allocation)
-        Self::update_penalty_mask_gpu(&mut penalty_mask, &semantic_token_tensor, &scatter_ones)?;
+        let (mut semantic_token, mut semantic_token_tensor) =
+            self.sample_semantic_token(initial_logits, &mut sampler, gen_config, 0, sampling_ctx)?;
         let mut token_count: usize = 1;
 
         // Accumulate frames as GPU tensors: Vec of [16] U32 tensors
@@ -649,23 +626,47 @@ impl Qwen3TTS {
             #[cfg(feature = "profiling")]
             let _sample_span = tracing::info_span!("sampling", frame = frame_idx).entered();
 
-            let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties_gpu(
-                &logits_2d,
-                &penalty_mask,
+            (semantic_token, semantic_token_tensor) = self.sample_semantic_token(
+                &new_logits,
+                &mut sampler,
                 gen_config,
                 token_count,
-                Some(&suppression_mask),
+                sampling_ctx,
             )?;
-
-            semantic_token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
-            semantic_token = semantic_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
-            Self::update_penalty_mask_gpu(&mut penalty_mask, &semantic_token_tensor, &scatter_ones)?;
             token_count += 1;
         }
 
         // Single GPU→CPU transfer: convert all accumulated GPU frames to FrameCodes
         self.gpu_frames_to_frame_codes(&gpu_frames)
+    }
+
+    /// Sample the next semantic token from `[1, 1, vocab]` talker logits.
+    ///
+    /// The logits are read back once and penalties + top-k/top-p sampling run
+    /// on the CPU: the token id is needed on the host anyway (EOS check), and
+    /// on Metal the ~20 tiny sampling kernels plus a GPU sort cost far more
+    /// than one 12 KB readback. Returns the id and a `[1]` U32 tensor of it on
+    /// the model device for the next embedding lookup.
+    fn sample_semantic_token(
+        &self,
+        logits: &Tensor,
+        sampler: &mut SemanticSampler,
+        config: &generation::GenerationConfig,
+        token_count: usize,
+        sampling_ctx: &mut generation::SamplingContext,
+    ) -> Result<(u32, Tensor)> {
+        let logits = logits.squeeze(1)?.to_device(&Device::Cpu)?;
+        let logits = self.apply_generation_penalties_gpu(
+            &logits,
+            &sampler.penalty_mask,
+            config,
+            token_count,
+            Some(&sampler.suppression_mask),
+        )?;
+        let token = generation::sample(&logits, config, sampling_ctx)?;
+        Self::update_penalty_mask_gpu(&mut sampler.penalty_mask, &token, &sampler.scatter_ones)?;
+        let token_id = token.flatten_all()?.to_vec1::<u32>()?[0];
+        Ok((token_id, Tensor::new(&[token_id], &self.device)?))
     }
 
     /// Update the GPU-side penalty mask using scatter (fully GPU-resident).
@@ -1535,6 +1536,32 @@ const ICL_FRAMES_PER_TOKEN: usize = 6;
 /// ICL mode: minimum repetition penalty to prevent degenerate loops (matching mlx-audio)
 const ICL_MIN_REPETITION_PENALTY: f64 = 1.5;
 
+/// Host-side state for semantic token sampling (see
+/// [`Qwen3TTS::sample_semantic_token`]).
+struct SemanticSampler {
+    /// `[1, vocab]` repetition-penalty mask, updated after each sampled token.
+    penalty_mask: Tensor,
+    /// Pre-built suppression mask (reused every frame).
+    suppression_mask: generation::SuppressionMask,
+    /// Pre-allocated ones tensor for the scatter-based penalty update.
+    scatter_ones: Tensor,
+}
+
+impl SemanticSampler {
+    fn new() -> Result<Self> {
+        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
+        Ok(Self {
+            penalty_mask: Tensor::zeros((1, vocab_size), DType::F32, &Device::Cpu)?,
+            suppression_mask: generation::build_suppression_mask(
+                vocab_size,
+                CODEC_EOS_TOKEN_ID,
+                &Device::Cpu,
+            )?,
+            scatter_ones: Tensor::ones((1, 1), DType::F32, &Device::Cpu)?,
+        })
+    }
+}
+
 /// Per-phase wall-clock breakdown of a streaming session.
 ///
 /// Collected only after [`StreamingSession::enable_profiling`]; each phase
@@ -1577,13 +1604,8 @@ pub struct StreamingSession<'a> {
     trailing_text_hidden: Tensor,
     trailing_text_len: usize,
     tts_pad_embed: Tensor,
-    // GPU-side repetition penalty mask [1, vocab] — updated incrementally
-    penalty_mask: Tensor,
+    sampler: SemanticSampler,
     token_count: usize,
-    // Pre-allocated ones tensor for scatter-based penalty update
-    scatter_ones: Tensor,
-    // Pre-built suppression mask (reused every frame)
-    suppression_mask: generation::SuppressionMask,
     // Pre-allocated code predictor KV caches (reused + reset each frame)
     cp_kv_caches: Vec<AnyKVCache>,
     // ICL reference codes for decoder context (voice cloning only).
@@ -1820,28 +1842,10 @@ impl<'a> StreamingSession<'a> {
         chunk_frames: usize,
         icl_ref_codes: Option<Tensor>,
     ) -> Result<Self> {
-        // Build suppression mask once for reuse across all frames
-        let suppression_mask = generation::build_suppression_mask(
-            codec_tokens::CODEC_VOCAB_SIZE,
-            CODEC_EOS_TOKEN_ID,
-            &model.device,
-        )?;
-
         // Sample first token with full penalty pipeline
-        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
-        let mut penalty_mask = Tensor::zeros((1, vocab_size), DType::F32, &model.device)?;
-        let logits_2d = logits.squeeze(1)?;
-        let logits_2d = model.apply_generation_penalties_gpu(
-            &logits_2d,
-            &penalty_mask,
-            &config,
-            0,
-            Some(&suppression_mask),
-        )?;
-        let first_token = generation::sample(&logits_2d, &config, &mut sampling_ctx)?;
-        let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-        let scatter_ones = Tensor::ones((1, 1), DType::F32, &model.device)?;
-        Qwen3TTS::update_penalty_mask_gpu(&mut penalty_mask, &first_token, &scatter_ones)?;
+        let mut sampler = SemanticSampler::new()?;
+        let (first_token_id, first_token) =
+            model.sample_semantic_token(&logits, &mut sampler, &config, 0, &mut sampling_ctx)?;
 
         let done = config.eos_token_id == Some(first_token_id);
         let cp_kv_caches = model.code_predictor.new_kv_caches();
@@ -1862,10 +1866,8 @@ impl<'a> StreamingSession<'a> {
             trailing_text_hidden,
             trailing_text_len,
             tts_pad_embed,
-            penalty_mask,
+            sampler,
             token_count: 1,
-            scatter_ones,
-            suppression_mask,
             cp_kv_caches,
             icl_ref_codes,
             last_token: first_token_id,
@@ -2024,21 +2026,12 @@ impl<'a> StreamingSession<'a> {
             let phase_start = self.record_phase(phase_start, |p| &mut p.talker_ms)?;
 
             // Sample next semantic token with repetition penalty + token suppression + min_new_tokens
-            let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.model.apply_generation_penalties_gpu(
-                &logits_2d,
-                &self.penalty_mask,
+            let (next_token_id, next_token_tensor) = self.model.sample_semantic_token(
+                &new_logits,
+                &mut self.sampler,
                 &self.config,
                 self.token_count,
-                Some(&self.suppression_mask),
-            )?;
-            let next_token_tensor =
-                generation::sample(&logits_2d, &self.config, &mut self.sampling_ctx)?;
-            let next_token_id: u32 = next_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
-            Qwen3TTS::update_penalty_mask_gpu(
-                &mut self.penalty_mask,
-                &next_token_tensor,
-                &self.scatter_ones,
+                &mut self.sampling_ctx,
             )?;
             self.token_count += 1;
             self.record_phase(phase_start, |p| &mut p.sampling_ms)?;
