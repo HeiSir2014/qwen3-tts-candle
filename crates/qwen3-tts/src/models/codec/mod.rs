@@ -15,6 +15,7 @@ pub mod decoder_12hz;
 pub mod decoder_block;
 pub mod encoder_12hz;
 mod quantizer;
+pub mod seanet_encoder;
 pub mod snake_beta;
 
 pub use causal_conv::CausalConv1d;
