@@ -91,11 +91,12 @@ TTS_BACKEND=mlx            # or rust
 # TTS_MLX_CV_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit (default; empty disables preset voices)
 ```
 
-Measured on Apple Silicon (0.6B Base, ICL voice clone, streaming): Candle Metal BF16
-RTF ≈ 3.0–3.3 (TTFB ≈ 2.7 s) vs mlx bf16 RTF ≈ 0.62–0.68 (TTFB ≈ 0.55 s).
-On Apple Silicon use `mlx`; Candle's Metal path is launch-bound. 4-bit MLX
-checkpoints are ~2x faster again but occasionally fail to emit EOS, so mlx-server
-caps generation length relative to the text.
+Measured on Apple Silicon (0.6B Base, ICL voice clone, streaming 0.8 s chunks,
+`cargo run --release --features metal,hub --example clone_stream_bench`):
+Candle 0.11 Metal BF16 RTF ≈ 0.58–0.64 (TTFB ≈ 0.64–0.67 s) vs mlx bf16
+RTF ≈ 0.65–0.70 (TTFB ≈ 0.57–0.60 s). 4-bit MLX checkpoints are ~2x faster
+again but occasionally fail to emit EOS, so mlx-server caps generation length
+relative to the text.
 
 ### Run TTS server only
 
