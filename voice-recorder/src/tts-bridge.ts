@@ -28,9 +28,17 @@ export const TTS_BACKEND = resolveBackend(process.env.TTS_BACKEND);
 export const EMBEDDING_EXTENSION = TTS_BACKEND === "mlx" ? ".npz" : ".bin";
 
 function serverCommand(): string[] {
-  return TTS_BACKEND === "mlx"
-    ? ["uv", "run", "--directory", MLX_SERVER_DIR, "server.py", "--port", String(TTS_PORT)]
-    : [TTS_BINARY, "--port", String(TTS_PORT)];
+  if (TTS_BACKEND === "mlx") {
+    return ["uv", "run", "--directory", MLX_SERVER_DIR, "server.py", "--port", String(TTS_PORT)];
+  }
+  // Optional CustomVoice model override, e.g. a local 1.7B dir for style instructions.
+  const customVoiceModel = process.env.TTS_RUST_CV_MODEL;
+  return [
+    TTS_BINARY,
+    "--port",
+    String(TTS_PORT),
+    ...(customVoiceModel !== undefined ? ["--custom-voice-model", customVoiceModel] : []),
+  ];
 }
 
 let ttsProcess: Subprocess | null = null;
