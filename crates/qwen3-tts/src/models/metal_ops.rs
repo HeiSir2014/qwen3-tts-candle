@@ -7,8 +7,10 @@ use std::sync::{Mutex, OnceLock};
 
 use candle_core::backend::BackendStorage;
 use candle_core::metal_backend::{buffer_o, DeviceId};
-use candle_core::{CpuStorage, CustomOp3, DType, Layout, MetalDevice, MetalStorage, Result, Shape};
-use candle_metal_kernels::metal::ComputePipeline;
+use candle_core::{
+    CpuStorage, CustomOp2, CustomOp3, DType, Layout, MetalDevice, MetalStorage, Result, Shape,
+};
+use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline};
 use candle_metal_kernels::utils::get_block_dims;
 use candle_metal_kernels::{set_params, Output};
 
@@ -35,7 +37,62 @@ kernel void snake_beta_f32(
     float s = precise::sin(alpha[c] * v);
     y[i] = v + inv_beta[c] * s * s;
 }
+
+// out = silu(gate) * up, elementwise over contiguous inputs
+template <typename T>
+void swiglu(
+    constant size_t &numel,
+    device const T *gate,
+    device const T *up,
+    device T *out,
+    uint i)
+{
+    if (i >= numel) {
+        return;
+    }
+    // Round silu(gate) to T like candle's separate silu and mul kernels.
+    float g = float(gate[i]);
+    T silu = T(g / (1.0f + exp(-g)));
+    out[i] = T(float(silu) * float(up[i]));
+}
+
+#define INSTANTIATE(NAME, T) \
+kernel void swiglu_##NAME( \
+    constant size_t &numel [[buffer(0)]], \
+    device const T *gate [[buffer(1)]], \
+    device const T *up [[buffer(2)]], \
+    device T *out [[buffer(3)]], \
+    uint i [[thread_position_in_grid]]) \
+{ \
+    swiglu<T>(numel, gate, up, out, i); \
+}
+
+INSTANTIATE(f32, float)
+INSTANTIATE(f16, half)
+INSTANTIATE(bf16, bfloat)
 "#;
+
+/// Dispatch `groups` threadgroups of `threads` threads along x.
+fn dispatch_1d(encoder: &ComputeCommandEncoder, groups: usize, threads: usize) {
+    // MTLSize is not re-exported by candle; get_block_dims hands one out.
+    let mut group_size = get_block_dims(1, 1, 1);
+    group_size.width = threads;
+    group_size.height = 1;
+    group_size.depth = 1;
+    let mut group_count = group_size;
+    group_count.width = groups;
+    encoder.dispatch_thread_groups(group_count, group_size);
+}
+
+/// Pick the `[f32, f16, bf16]` kernel name for `dtype`.
+fn kernel_for(dtype: DType, names: [&'static str; 3]) -> Result<&'static str> {
+    Ok(match dtype {
+        DType::F32 => names[0],
+        DType::F16 => names[1],
+        DType::BF16 => names[2],
+        dtype => candle_core::bail!("unsupported dtype {dtype:?} for fused Metal op"),
+    })
+}
 
 /// Compile [`SOURCE`] once per device and return the named pipeline.
 fn pipeline(device: &MetalDevice, name: &'static str) -> Result<ComputePipeline> {
@@ -131,19 +188,71 @@ impl CustomOp3 for SnakeBetaOp {
                 Output::new(&output)
             )
         );
-        // MTLSize is not re-exported by candle; get_block_dims hands one out.
         let width = pipeline.max_total_threads_per_threadgroup().min(numel);
-        let mut group_size = get_block_dims(1, 1, 1);
-        group_size.width = width;
-        group_size.height = 1;
-        group_size.depth = 1;
-        let mut group_count = group_size;
-        group_count.width = numel.div_ceil(width);
-        encoder.dispatch_thread_groups(group_count, group_size);
+        dispatch_1d(encoder, numel.div_ceil(width), width);
 
         Ok((
             MetalStorage::new(output, device.clone(), numel, DType::F32),
             x_l.shape().clone(),
+        ))
+    }
+}
+
+/// Fused SwiGLU gate: `silu(gate) * up`.
+pub struct SwigluOp;
+
+impl CustomOp2 for SwigluOp {
+    fn name(&self) -> &'static str {
+        "swiglu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("swiglu custom op is Metal-only")
+    }
+
+    fn metal_fwd(
+        &self,
+        gate: &MetalStorage,
+        gate_l: &Layout,
+        up: &MetalStorage,
+        up_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        let dtype = gate.dtype();
+        if up.dtype() != dtype || gate_l.shape() != up_l.shape() {
+            candle_core::bail!("swiglu expects gate and up of the same dtype and shape");
+        }
+        if !gate_l.is_contiguous() || !up_l.is_contiguous() {
+            candle_core::bail!("swiglu expects contiguous inputs");
+        }
+        let numel = gate_l.shape().elem_count();
+        let name = kernel_for(dtype, ["swiglu_f32", "swiglu_f16", "swiglu_bf16"])?;
+
+        let device = gate.device();
+        let pipeline = pipeline(device, name)?;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(numel, dtype)
+            .with_label("swiglu")
+            .build()?;
+
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        let gate_b = buffer_o(gate.buffer(), gate_l, dtype);
+        let up_b = buffer_o(up.buffer(), up_l, dtype);
+        set_params!(encoder, (numel, &gate_b, &up_b, Output::new(&output)));
+        let width = pipeline.max_total_threads_per_threadgroup().min(numel);
+        dispatch_1d(encoder, numel.div_ceil(width), width);
+
+        Ok((
+            MetalStorage::new(output, device.clone(), numel, dtype),
+            gate_l.shape().clone(),
         ))
     }
 }

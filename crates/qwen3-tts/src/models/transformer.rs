@@ -333,8 +333,16 @@ impl MLP {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = candle_nn::ops::silu(&gate)?;
         let up = self.up_proj.forward(x)?;
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() {
+            // One fused kernel instead of separate silu and mul.
+            let hidden = gate
+                .contiguous()?
+                .apply_op2_no_bwd(&up.contiguous()?, &super::metal_ops::SwigluOp)?;
+            return Ok(self.down_proj.forward(&hidden)?);
+        }
+        let gate = candle_nn::ops::silu(&gate)?;
         Ok(self.down_proj.forward(&(gate * up)?)?)
     }
 }
@@ -691,6 +699,62 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(max_diff < 1e-3, "metal vs cpu max diff {max_diff}");
+    }
+
+    /// The fused SwiGLU Metal kernel must match the CPU silu * mul path.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_mlp_matches_cpu() {
+        use std::collections::HashMap;
+
+        let Ok(metal) = Device::new_metal(0) else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let config = small_config();
+        let (h, i) = (config.hidden_size, config.intermediate_size);
+        let weights: HashMap<String, Tensor> = [
+            ("gate_proj.weight", (i, h)),
+            ("up_proj.weight", (i, h)),
+            ("down_proj.weight", (h, i)),
+        ]
+        .into_iter()
+        .map(|(name, shape)| {
+            let w = Tensor::randn(0.0f32, 0.2, shape, &cpu).unwrap();
+            (name.to_string(), w)
+        })
+        .collect();
+        let input = Tensor::randn(0.0f32, 1.0, (1, 3, h), &cpu).unwrap();
+
+        // CPU has no bf16 matmul, so the reference is always f32.
+        let run = |device: &Device, dtype: DType| -> Vec<f32> {
+            let vb = VarBuilder::from_tensors(weights.clone(), dtype, device);
+            let mlp = MLP::new(&config, vb).unwrap();
+            let x = input.to_dtype(dtype).unwrap().to_device(device).unwrap();
+            mlp.forward(&x)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let expected = run(&cpu, DType::F32);
+        let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+        // Tolerances relative to the output range; bf16 rounds every op.
+        for (dtype, tolerance) in [(DType::F32, 1e-5), (DType::BF16, 3e-2)] {
+            let actual = run(&metal, dtype);
+            let max_diff = expected
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_diff < tolerance * scale,
+                "{dtype:?}: max diff {max_diff} (output range {scale})"
+            );
+        }
     }
 
     #[test]
