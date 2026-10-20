@@ -17,7 +17,7 @@ interface RateLimitEntry {
 
 const rateLimitMap = new Map<string, RateLimitEntry>();
 const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQUESTS = 30;
+const RATE_LIMIT_MAX_REQUESTS = 60;
 const RATE_LIMIT_CLONE_MAX = 5;
 
 // Cleanup stale entries every 5 minutes

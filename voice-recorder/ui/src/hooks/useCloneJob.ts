@@ -3,8 +3,13 @@ import * as api from "../api";
 
 const PENDING_JOB_KEY = "voice_lab_pending_job";
 
-/** Number of chunks to buffer before starting playback. */
-const JITTER_BUFFER_SIZE = 1;
+/**
+ * Number of decoded AudioBuffers to accumulate before starting playback.
+ * The mlx backend streams ~0.8s chunks at RTF ~0.65, so 3 chunks give ~2.4s
+ * of audio as margin for generation speed fluctuations (e.g. attention spikes
+ * on long sequences) while adding only ~1s of start latency.
+ */
+const JITTER_BUFFER_SIZE = 3;
 
 interface PendingJob {
   jobId: string;
@@ -46,98 +51,130 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
   const [recovered, setRecovered] = useState(false);
   const [progress, setProgress] = useState<CloneProgress | null>(null);
 
-  // ── Chunk playback engine (ref-based to avoid stale closures) ──
-  const chunkUrlsRef = useRef<string[]>([]);
+  // ── Gapless Web Audio API playback engine ──
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const decodedBuffersRef = useRef<AudioBuffer[]>([]);
+  const scheduledCountRef = useRef(0);       // how many buffers have been scheduled
+  const nextPlayTimeRef = useRef(0);         // AudioContext time for next buffer start
+  const startedRef = useRef(false);          // true once playback has begun
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const segmentTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+
   const chunksFetchedRef = useRef(0);
-  const fetchTargetRef = useRef(0);   // highest chunk target requested
-  const fetchingRef = useRef(false);  // mutex: true while fetch loop is running
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const playingIndexRef = useRef(-1); // -1 = not started
-  const stalledRef = useRef(false);   // true = waiting for next chunk
+  const fetchTargetRef = useRef(0);
+  const fetchingRef = useRef(false);
   const generationDoneRef = useRef(false);
   const esRef = useRef<EventSource | null>(null);
   const sseRetryRef = useRef(0);
   const MAX_SSE_RETRIES = 5;
 
-  // Segment tracking for playback highlighting
+  // Segment tracking for dialog playback highlighting
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number | null>(null);
   const chunkToSegmentRef = useRef<number[]>([]);
 
   // Force re-render when chunk count changes (for progress display)
   const [, setChunkCount] = useState(0);
 
-  /**
-   * Core scheduling function: play the next available chunk or stall.
-   * Called from both onended and when new chunks arrive.
-   */
-  const scheduleNext = useCallback(() => {
-    const urls = chunkUrlsRef.current;
-    const nextIdx = playingIndexRef.current;
-
-    if (nextIdx < 0) {
-      // Not started yet — check if we have enough buffered
-      const threshold = generationDoneRef.current ? 1 : JITTER_BUFFER_SIZE;
-      if (urls.length >= threshold) {
-        playingIndexRef.current = 0;
-        stalledRef.current = false;
-        const url = urls[0]!;
-        const segIdx = chunkToSegmentRef.current[0];
-        if (segIdx !== undefined) setActiveSegmentIndex(segIdx);
-        const audio = audioRef.current || new Audio();
-        audioRef.current = audio;
-        audio.src = url;
-        audio.onended = () => {
-          playingIndexRef.current++;
-          scheduleNext();
-        };
-        audio.play().catch(() => {});
-      }
-      return;
+  /** Lazily create a shared AudioContext. */
+  const getAudioCtx = useCallback(() => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioContext();
     }
-
-    if (nextIdx < urls.length) {
-      // Next chunk is ready — play it
-      stalledRef.current = false;
-      const url = urls[nextIdx]!;
-      const segIdx = chunkToSegmentRef.current[nextIdx];
-      if (segIdx !== undefined) setActiveSegmentIndex(segIdx);
-      const audio = audioRef.current || new Audio();
-      audioRef.current = audio;
-      audio.src = url;
-      audio.onended = () => {
-        playingIndexRef.current++;
-        scheduleNext();
-      };
-      audio.play().catch(() => {});
-    } else if (generationDoneRef.current) {
-      // All chunks played, generation done — finished
-      stalledRef.current = false;
-      setActiveSegmentIndex(null);
-    } else {
-      // Stalled: RTF > 1, waiting for next chunk
-      stalledRef.current = true;
+    // Resume if suspended (browser autoplay policy)
+    if (audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume();
     }
+    return audioCtxRef.current;
   }, []);
 
-  const addChunkUrl = useCallback(
-    (url: string) => {
-      chunkUrlsRef.current = [...chunkUrlsRef.current, url];
-      setChunkCount((c) => c + 1);
-      // If stalled or not started, try to resume/start
-      if (stalledRef.current || playingIndexRef.current < 0) {
-        scheduleNext();
+  /**
+   * Core gapless scheduling: schedule all unscheduled AudioBuffers at precise
+   * timestamps so they play back-to-back with no gaps.
+   *
+   * Uses AudioBufferSourceNode.start(time) for sample-accurate scheduling.
+   * If we fall behind (stall recovery), resets the schedule from "now".
+   */
+  const scheduleNext = useCallback(() => {
+    const buffers = decodedBuffersRef.current;
+
+    if (!startedRef.current) {
+      // Check jitter buffer threshold before starting
+      const threshold = generationDoneRef.current ? 1 : JITTER_BUFFER_SIZE;
+      if (buffers.length < threshold) return;
+
+      const ctx = getAudioCtx();
+      startedRef.current = true;
+      nextPlayTimeRef.current = ctx.currentTime + 0.05; // tiny lead-in
+    }
+
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+
+    // Schedule all unscheduled buffers
+    while (scheduledCountRef.current < buffers.length) {
+      const idx = scheduledCountRef.current;
+      const buffer = buffers[idx]!;
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+
+      let startTime = nextPlayTimeRef.current;
+      if (startTime < ctx.currentTime) {
+        // Stall recovery: we fell behind, reset schedule from now
+        startTime = ctx.currentTime + 0.02;
       }
+
+      source.start(startTime);
+
+      // Schedule segment highlight at the start time of this chunk
+      const segIdx = chunkToSegmentRef.current[idx];
+      if (segIdx !== undefined) {
+        const delayMs = Math.max(0, (startTime - ctx.currentTime) * 1000);
+        const timer = setTimeout(() => setActiveSegmentIndex(segIdx), delayMs);
+        segmentTimersRef.current.push(timer);
+      }
+
+      // Track active sources for cleanup
+      activeSourcesRef.current.push(source);
+      source.onended = () => {
+        activeSourcesRef.current = activeSourcesRef.current.filter(
+          (s) => s !== source
+        );
+        // Clear segment highlight when all playback is done
+        if (
+          activeSourcesRef.current.length === 0 &&
+          generationDoneRef.current &&
+          scheduledCountRef.current >= decodedBuffersRef.current.length
+        ) {
+          setActiveSegmentIndex(null);
+        }
+      };
+
+      nextPlayTimeRef.current = startTime + buffer.duration;
+      scheduledCountRef.current++;
+    }
+  }, [getAudioCtx]);
+
+  /**
+   * Decode a WAV blob into an AudioBuffer and schedule it for gapless playback.
+   */
+  const addChunkBuffer = useCallback(
+    async (wavBlob: Blob) => {
+      const ctx = getAudioCtx();
+      const arrayBuffer = await wavBlob.arrayBuffer();
+      const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+      decodedBuffersRef.current.push(audioBuffer);
+      setChunkCount((c) => c + 1);
+      scheduleNext();
     },
-    [scheduleNext]
+    [getAudioCtx, scheduleNext]
   );
 
   const fetchChunksUpTo = useCallback(
     async (jobId: string, target: number) => {
-      // Update target (may grow while a fetch loop is already running)
       fetchTargetRef.current = Math.max(fetchTargetRef.current, target);
 
-      // Mutex: only one fetch loop at a time. Concurrent callers just
-      // bump the target above — the running loop will pick it up.
+      // Mutex: only one fetch loop at a time
       if (fetchingRef.current) return;
       fetchingRef.current = true;
 
@@ -146,8 +183,7 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
           const idx = chunksFetchedRef.current;
           try {
             const blob = await api.cloneJobChunkAudio(jobId, idx);
-            const url = URL.createObjectURL(blob);
-            addChunkUrl(url);
+            await addChunkBuffer(blob);
             chunksFetchedRef.current = idx + 1;
           } catch {
             break; // chunk not ready, will retry on next event
@@ -157,7 +193,7 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
         fetchingRef.current = false;
       }
     },
-    [addChunkUrl]
+    [addChunkBuffer]
   );
 
   const closeEventSource = useCallback(() => {
@@ -167,20 +203,42 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
     }
   }, []);
 
+  /** Stop all active AudioBufferSourceNodes and clear segment timers. */
+  const teardownPlayback = useCallback(() => {
+    // Stop all scheduled sources
+    for (const source of activeSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        /* already stopped */
+      }
+    }
+    activeSourcesRef.current = [];
+
+    // Clear segment highlight timers
+    for (const timer of segmentTimersRef.current) {
+      clearTimeout(timer);
+    }
+    segmentTimersRef.current = [];
+
+    // Reset scheduling state
+    decodedBuffersRef.current = [];
+    scheduledCountRef.current = 0;
+    nextPlayTimeRef.current = 0;
+    startedRef.current = false;
+    setActiveSegmentIndex(null);
+  }, []);
+
   const watchJob = useCallback(
     (jobId: string, profileId: string) => {
       setStatus("polling");
       // Reset playback state
-      chunkUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
-      chunkUrlsRef.current = [];
+      teardownPlayback();
       chunksFetchedRef.current = 0;
       fetchTargetRef.current = 0;
       fetchingRef.current = false;
-      playingIndexRef.current = -1;
-      stalledRef.current = false;
       generationDoneRef.current = false;
       chunkToSegmentRef.current = [];
-      setActiveSegmentIndex(null);
       setChunkCount(0);
 
       closeEventSource();
@@ -218,8 +276,8 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
         closeEventSource();
         generationDoneRef.current = true;
 
-        // If playback hasn't started or is stalled, kick it
-        if (playingIndexRef.current < 0 || stalledRef.current) {
+        // If playback hasn't started, kick it (threshold drops to 1)
+        if (!startedRef.current) {
           scheduleNext();
         }
 
@@ -249,7 +307,7 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
         setProgress(null);
       });
 
-      // Connection error — fall back to single status check then reconnect (with retry limit)
+      // Connection error — fall back to single status check then reconnect
       es.onerror = () => {
         closeEventSource();
         sseRetryRef.current++;
@@ -284,7 +342,6 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
               watchJob(jobId, profileId);
             }
           } catch {
-            // Job not found or server error — give up after retries
             if (sseRetryRef.current >= MAX_SSE_RETRIES) {
               clearPendingJob();
               setError("Clone job lost. Server may have restarted.");
@@ -297,7 +354,7 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
         }, 1000);
       };
     },
-    [closeEventSource, fetchChunksUpTo, scheduleNext, onHistoryRefresh]
+    [closeEventSource, teardownPlayback, fetchChunksUpTo, scheduleNext, onHistoryRefresh]
   );
 
   const submit = useCallback(
@@ -380,43 +437,33 @@ export function useCloneJob(onHistoryRefresh?: (profileId: string) => void) {
 
   // Cleanup on unmount
   useEffect(() => {
-    return () => closeEventSource();
-  }, [closeEventSource]);
+    return () => {
+      closeEventSource();
+      teardownPlayback();
+    };
+  }, [closeEventSource, teardownPlayback]);
 
   const reset = useCallback(() => {
     closeEventSource();
+    teardownPlayback();
+    chunksFetchedRef.current = 0;
+    fetchTargetRef.current = 0;
+    fetchingRef.current = false;
+    generationDoneRef.current = false;
+    chunkToSegmentRef.current = [];
+    setChunkCount(0);
     setStatus("idle");
     setError(null);
     setProgress(null);
-    setActiveSegmentIndex(null);
-    chunkToSegmentRef.current = [];
-    stalledRef.current = false;
-    generationDoneRef.current = false;
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.onended = null;
-      audioRef.current = null;
-    }
-    playingIndexRef.current = -1;
-    chunkUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
-    chunkUrlsRef.current = [];
-    setChunkCount(0);
     setResultBlobUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return null;
     });
-  }, [closeEventSource]);
+  }, [closeEventSource, teardownPlayback]);
 
   const stopPlayback = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.onended = null;
-      audioRef.current = null;
-    }
-    playingIndexRef.current = -1;
-    stalledRef.current = false;
-    setActiveSegmentIndex(null);
-  }, []);
+    teardownPlayback();
+  }, [teardownPlayback]);
 
   const downloading = status === "submitting" || status === "polling";
 
