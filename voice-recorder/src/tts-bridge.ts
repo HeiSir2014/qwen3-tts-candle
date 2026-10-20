@@ -28,9 +28,17 @@ export const TTS_BACKEND = resolveBackend(process.env.TTS_BACKEND);
 export const EMBEDDING_EXTENSION = TTS_BACKEND === "mlx" ? ".npz" : ".bin";
 
 function serverCommand(): string[] {
-  return TTS_BACKEND === "mlx"
-    ? ["uv", "run", "--directory", MLX_SERVER_DIR, "server.py", "--port", String(TTS_PORT)]
-    : [TTS_BINARY, "--port", String(TTS_PORT)];
+  if (TTS_BACKEND === "mlx") {
+    return ["uv", "run", "--directory", MLX_SERVER_DIR, "server.py", "--port", String(TTS_PORT)];
+  }
+  // Optional CustomVoice model override, e.g. a local 1.7B dir for style instructions.
+  const customVoiceModel = process.env.TTS_RUST_CV_MODEL;
+  return [
+    TTS_BINARY,
+    "--port",
+    String(TTS_PORT),
+    ...(customVoiceModel !== undefined ? ["--custom-voice-model", customVoiceModel] : []),
+  ];
 }
 
 let ttsProcess: Subprocess | null = null;
@@ -123,6 +131,8 @@ export interface SystemVoice {
   id: string;
   name: string;
   description: string;
+  /** Whether the model follows a style instruction (1.7B CustomVoice only). */
+  instruct?: boolean;
 }
 
 /** Preset CustomVoice speakers; empty when the server has no CustomVoice model. */
@@ -284,10 +294,15 @@ export function requestCloneStream(
 
 /** Preset-voice synthesis (CustomVoice model), same frame protocol as cloning. */
 export function requestTtsStream(
-  body: { voice: string; text: string; language: string },
+  body: { voice: string; text: string; language: string; instruct?: string },
   requestId?: string
 ): AsyncGenerator<CloneStreamChunk, void, undefined> {
-  log.info("tts_stream_start", { requestId, voice: body.voice, text_length: body.text.length });
+  log.info("tts_stream_start", {
+    requestId,
+    voice: body.voice,
+    text_length: body.text.length,
+    instruct: body.instruct,
+  });
   return requestFrameStream("/tts-stream", body, requestId);
 }
 

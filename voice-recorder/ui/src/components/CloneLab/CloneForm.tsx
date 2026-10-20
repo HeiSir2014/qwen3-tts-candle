@@ -24,7 +24,7 @@ interface Props {
     language: string,
     profileMapping: ProfileMapping
   ) => void;
-  onSystemSubmit: (voice: string, text: string, language: string) => void;
+  onSystemSubmit: (voice: string, text: string, language: string, instruct: string) => void;
   onProfileChange: (profileId: string | null) => void;
   activeSegmentIndex: number | null;
 }
@@ -54,6 +54,7 @@ export function CloneForm({
   const [singleText, setSingleText] = useState("");
   const [dialogText, setDialogText] = useState("");
   const [language, setLanguage] = useState("Auto");
+  const [instruct, setInstruct] = useState("");
 
   // Dialog mode state — speaker names extracted from Tiptap content
   const [speakerNames, setSpeakerNames] = useState<string[]>([]);
@@ -113,7 +114,12 @@ export function CloneForm({
     if (mode === "single") {
       if (systemVoice) {
         if (!singleText.trim()) return;
-        onSystemSubmit(systemVoice.id, singleText.trim(), language);
+        onSystemSubmit(
+          systemVoice.id,
+          singleText.trim(),
+          language,
+          systemVoice.instruct ? instruct.trim() : ""
+        );
         return;
       }
       if (!profileId || !recordingId || !singleText.trim()) return;
@@ -189,6 +195,20 @@ export function CloneForm({
               )}
             </select>
           </div>
+
+          {systemVoice?.instruct && (
+            <div className="form-group">
+              <label htmlFor="tts-instruct">{t("tts_instruct")}</label>
+              <input
+                id="tts-instruct"
+                type="text"
+                value={instruct}
+                maxLength={200}
+                onChange={(e) => setInstruct(e.target.value)}
+                placeholder={t("tts_instruct_placeholder")}
+              />
+            </div>
+          )}
 
           {!systemVoice && (
             <div className="form-group">

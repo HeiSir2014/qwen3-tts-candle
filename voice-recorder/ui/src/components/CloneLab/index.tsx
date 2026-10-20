@@ -93,9 +93,9 @@ export function CloneLab({ profiles }: Props) {
   );
 
   const handleSystemSubmit = useCallback(
-    async (voice: string, text: string, language: string) => {
+    async (voice: string, text: string, language: string, instruct: string) => {
       try {
-        const { jobId } = await api.ttsSubmit(voice, text, language);
+        const { jobId } = await api.ttsSubmit(voice, text, language, instruct);
         cloneJob.watchExternalJob(jobId, SYSTEM_PROFILE_ID);
       } catch (err: any) {
         showToast(err.message);

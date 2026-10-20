@@ -86,6 +86,8 @@ const strings = {
     system_voice_badge: "Built-in",
     system_voices_group: "Built-in Voices",
     user_profiles_group: "My Profiles",
+    tts_instruct: "Speaking style (optional)",
+    tts_instruct_placeholder: "e.g. Very happy. / Speak in a whisper",
   },
   zh: {
     title: "声音实验室",
@@ -163,6 +165,8 @@ const strings = {
     system_voice_badge: "内置",
     system_voices_group: "内置角色",
     user_profiles_group: "我的档案",
+    tts_instruct: "语气 / 情绪（可选）",
+    tts_instruct_placeholder: "例如：用特别愤怒的语气说",
   },
 } as const;
 

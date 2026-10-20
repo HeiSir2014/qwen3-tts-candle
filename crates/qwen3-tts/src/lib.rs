@@ -166,6 +166,8 @@ pub struct Qwen3TTS {
     speech_encoder: Option<Encoder12Hz>,
     /// Detected model variant (None if loaded without config.json)
     model_type: Option<ModelType>,
+    /// `tts_model_size` from config.json, e.g. "0b6" or "1b7"
+    model_size: Option<String>,
     /// Device to run inference on
     device: Device,
     /// Compute dtype for talker + code predictor (BF16 on CUDA, F32 otherwise)
@@ -353,6 +355,7 @@ impl Qwen3TTS {
         let speech_encoder = Self::try_load_speech_encoder(decoder_weights, device)?;
 
         let model_type = parsed_config.map(|c| c.model_type);
+        let model_size = parsed_config.map(|c| c.model_size.clone());
 
         Ok(Self {
             talker,
@@ -362,6 +365,7 @@ impl Qwen3TTS {
             speaker_encoder,
             speech_encoder,
             model_type,
+            model_size,
             device: device.clone(),
             compute_dtype,
         })
@@ -401,6 +405,15 @@ impl Qwen3TTS {
             Some(ModelType::Base) | Some(ModelType::VoiceDesign) => false,
             None => true, // permissive when unknown
         }
+    }
+
+    /// Whether this model follows style instructions for preset speakers.
+    ///
+    /// Only the 1.7B CustomVoice model was trained with them; the official
+    /// `generate_custom_voice` drops `instruct` for the 0.6B one.
+    pub fn supports_instruct(&self) -> bool {
+        matches!(&self.model_type, Some(ModelType::CustomVoice))
+            && self.model_size.as_deref() != Some("0b6")
     }
 
     /// Whether this model supports voice design (text-described voice conditioning).
@@ -452,6 +465,7 @@ impl Qwen3TTS {
         let (hidden, logits) =
             self.talker.prefill_custom_voice_non_streaming(
                 &input_ids,
+                &[],
                 speaker,
                 language,
                 &mut kv_caches,
@@ -801,6 +815,7 @@ impl Qwen3TTS {
         let (hidden, logits) =
             self.talker.prefill_custom_voice_non_streaming(
                 &input_ids,
+                &[],
                 speaker,
                 language,
                 &mut kv_caches,
@@ -1123,8 +1138,38 @@ impl Qwen3TTS {
         language: Language,
         options: SynthesisOptions,
     ) -> Result<StreamingSession<'_>> {
+        self.synthesize_streaming_with_instruct(text, speaker, language, "", options)
+    }
+
+    /// [`Self::synthesize_streaming`] with a style instruction such as
+    /// "用特别愤怒的语气说" or "Very happy.". An empty `instruct` means none.
+    ///
+    /// The instruction is ignored, with a warning, on models that weren't
+    /// trained for it (see [`Self::supports_instruct`]), as the official
+    /// implementation does.
+    pub fn synthesize_streaming_with_instruct(
+        &self,
+        text: &str,
+        speaker: Speaker,
+        language: Language,
+        instruct: &str,
+        options: SynthesisOptions,
+    ) -> Result<StreamingSession<'_>> {
         let input_ids = self.text_tokenizer.encode(text)?;
-        StreamingSession::new(self, &input_ids, speaker, language, options)
+        let instruct = instruct.trim();
+        let instruct_ids = if instruct.is_empty() {
+            Vec::new()
+        } else if !self.supports_instruct() {
+            tracing::warn!(
+                model_size = ?self.model_size,
+                "Ignoring style instruction: only the 1.7B CustomVoice model supports it"
+            );
+            Vec::new()
+        } else {
+            self.text_tokenizer
+                .encode(&format!("<|im_start|>user\n{}<|im_end|>\n", instruct))?
+        };
+        StreamingSession::new(self, &input_ids, &instruct_ids, speaker, language, options)
     }
 
     /// Synthesize speech using a text-described voice (VoiceDesign model), streaming.
@@ -1637,6 +1682,7 @@ impl<'a> StreamingSession<'a> {
     fn new(
         model: &'a Qwen3TTS,
         input_ids: &[u32],
+        instruct_ids: &[u32],
         speaker: Speaker,
         language: Language,
         options: SynthesisOptions,
@@ -1651,6 +1697,7 @@ impl<'a> StreamingSession<'a> {
         let mut kv_caches = model.talker.new_kv_caches(config.max_new_tokens + 256);
         let prefill_result = model.talker.prefill_custom_voice_non_streaming(
             input_ids,
+            instruct_ids,
             speaker,
             language,
             &mut kv_caches,

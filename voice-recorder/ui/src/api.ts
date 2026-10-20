@@ -110,12 +110,13 @@ export function getSystemProfiles(): Promise<SystemProfile[]> {
 export function ttsSubmit(
   voice: string,
   text: string,
-  language: string
+  language: string,
+  instruct: string
 ): Promise<{ jobId: string }> {
   return fetch("/api/tts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ voice, text, language }),
+    body: JSON.stringify({ voice, text, language, ...(instruct && { instruct }) }),
   }).then((r) => json<{ jobId: string }>(r));
 }
 

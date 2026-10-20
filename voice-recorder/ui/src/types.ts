@@ -24,6 +24,8 @@ export interface SystemProfile {
   id: string;
   name: string;
   description: string;
+  /** Whether the model follows a style instruction (1.7B CustomVoice only). */
+  instruct?: boolean;
 }
 
 export const SYSTEM_PROFILE_ID = "__system__";
@@ -43,6 +45,7 @@ export interface TtsJob {
   chunksTotal?: number;
   mode?: "single" | "dialog" | "tts";
   voice?: string;
+  instruct?: string;
   dialogSegments?: { profileName: string; text: string }[];
   profileIds?: string[];
   audioDurationS?: number;

@@ -89,6 +89,7 @@ Select it in `voice-recorder/.env`:
 
 ```bash
 TTS_BACKEND=rust           # or mlx
+# TTS_RUST_CV_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice           (default; a local dir works too, empty disables preset voices)
 # TTS_MLX_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16          (default)
 # TTS_MLX_CV_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit (default; empty disables preset voices)
 ```
@@ -164,7 +165,7 @@ let audio = model.synthesize("Custom settings!", Some(options))?;
 | `POST` | `/clone-stream` | Voice clone with streaming binary frame response |
 | `POST` | `/cache/clear` | Clear in-memory prompt cache (rust only) |
 | `GET` | `/speakers` | CustomVoice preset speakers (empty when disabled) |
-| `POST` | `/tts-stream` | Preset-speaker synthesis `{voice, text, language}`, same frame protocol |
+| `POST` | `/tts-stream` | Preset-speaker synthesis `{voice, text, language, instruct?}`, same frame protocol; `instruct` (e.g. "用特别愤怒的语气说") needs the 1.7B CustomVoice model |
 
 ### Streaming protocol
 
