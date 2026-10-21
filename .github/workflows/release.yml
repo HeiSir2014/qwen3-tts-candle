@@ -93,14 +93,15 @@ jobs:
         with:
           key: ${{ matrix.label }}
 
+      # pwsh, not bash: Git Bash's /usr/bin/link would shadow MSVC's link.exe.
       - name: Build
-        shell: bash
+        shell: pwsh
         env:
           FEATURES: ${{ matrix.features }}
-        run: |
-          cargo build --release --locked \
-            -p tts-server -p qwen3-tts --bin tts-server --bin generate_audio \
-            --no-default-features --features "$FEATURES"
+        run: >-
+          cargo build --release --locked
+          -p tts-server -p qwen3-tts --bin tts-server --bin generate_audio
+          --no-default-features --features "$env:FEATURES"
 
       - name: Smoke test
         shell: bash
