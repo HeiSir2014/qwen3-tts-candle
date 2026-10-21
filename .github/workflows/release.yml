@@ -1,0 +1,173 @@
+name: Release
+
+# Tag pushes (vX.Y.Z) build every target and publish a GitHub Release.
+# Pull requests touching the release pipeline only build, to catch breakage early.
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/package-release.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        name: Read version and check it matches the tag
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "tts-server") | .version')"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match tts-server version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64-metal
+            os: macos-15
+            features: tts-server/metal,qwen3-tts/cli
+          - label: windows-x64-cpu
+            os: windows-2025
+            features: qwen3-tts/cli
+            # Static CRT: no Visual C++ Redistributable needed on the user's machine.
+            rustflags: -C target-feature=+crt-static
+          - label: windows-x64-cuda
+            # CUDA 13.0 nvcc supports up to VS 2022; windows-2025 ships VS 2026.
+            # 13.0 is kept over newer toolkits because its PTX loads on the oldest drivers.
+            os: windows-2022
+            features: tts-server/cuda,qwen3-tts/cli
+            cuda: "13.0.2"
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      # Metal bf16 kernels need macOS 14+.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # The runner has no GPU. sm_80 PTX is JIT-compiled by the driver on newer GPUs.
+      CUDA_COMPUTE_CAP: "80"
+      # candle-kernels needs MSVC's conforming preprocessor (huggingface/candle#3686).
+      NVCC_PREPEND_FLAGS: -Xcompiler /Zc:preprocessor
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - if: matrix.cuda
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          # ug-cuda (via candle-core/cuda) links cuBLAS, cuRAND and NVRTC at build time.
+          sub-packages: >-
+            ["nvcc", "crt", "nvvm", "cudart", "thrust",
+            "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]
+          log-file-suffix: ${{ matrix.label }}.txt
+
+      - if: matrix.cuda
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.label }}
+
+      # pwsh, not bash: Git Bash's /usr/bin/link would shadow MSVC's link.exe.
+      - name: Build
+        shell: pwsh
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: >-
+          cargo build --release --locked
+          -p tts-server -p qwen3-tts --bin tts-server --bin generate_audio
+          --no-default-features --features "$env:FEATURES"
+
+      - name: Smoke test
+        if: ${{ !matrix.cuda }}
+        shell: bash
+        run: |
+          target/release/tts-server --help
+          target/release/generate_audio --help
+
+      # The runner has no NVIDIA driver (nvcuda.dll), so CUDA binaries cannot start; list their DLL imports instead.
+      - name: Smoke test (DLL imports)
+        if: matrix.cuda
+        shell: pwsh
+        run: |
+          dumpbin /nologo /dependents target/release/tts-server.exe
+          dumpbin /nologo /dependents target/release/generate_audio.exe
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          LABEL: ${{ matrix.label }}
+        run: scripts/package-release.sh "$VERSION" "$LABEL"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # Draft first, publish once every asset is uploaded, so no one sees a partial release.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          prerelease=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft --verify-tag --generate-notes --title "$GITHUB_REF_NAME" "${prerelease[@]}"
+          gh release edit "$GITHUB_REF_NAME" --draft=false
