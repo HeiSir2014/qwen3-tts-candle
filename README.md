@@ -52,6 +52,31 @@ Text ──→ [TalkerModel] ──→ semantic tokens (1 per frame)
 - **uv** (optional) — [docs.astral.sh/uv](https://docs.astral.sh/uv/), only for the `mlx` backend (Apple Silicon)
 - **Bun** (optional, for Voice Recorder UI) — [bun.sh](https://bun.sh)
 
+### Prebuilt binaries
+
+[Releases](https://github.com/HeiSir2014/qwen3-tts-candle/releases) ship `tts-server` and `generate_audio`:
+
+| Asset | Platform | Requirements |
+|-------|----------|--------------|
+| `*-macos-arm64-metal.tar.gz` | macOS, Apple Silicon | macOS 14+ |
+| `*-windows-x64-cpu.zip` | Windows x64 | none |
+| `*-windows-x64-cuda.zip` | Windows x64, NVIDIA GPU (sm_80+) | NVIDIA driver 580+ and CUDA 13 runtime (cuBLAS, cuRAND) on `PATH` |
+
+The macOS binaries are not notarized. If downloaded through a browser, clear the quarantine flag:
+
+```bash
+xattr -d com.apple.quarantine tts-server generate_audio
+```
+
+Verify a download against its build provenance:
+
+```bash
+gh attestation verify qwen3-tts-candle-<version>-<label>.zip --repo HeiSir2014/qwen3-tts-candle
+```
+
+To cut a release, bump `version` in `tts-server/Cargo.toml` (commit the refreshed `Cargo.lock` too), then push a matching tag
+(`git tag v0.1.0 && git push origin v0.1.0`). A tag with a suffix (`v0.2.0-rc.1`) is published as a prerelease.
+
 ### One-command startup (server + UI)
 
 ```bash

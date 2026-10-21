@@ -17,3 +17,6 @@ voice-recorder/.env
 # OS
 .DS_Store
 *.swp
+
+# Release packaging
+/dist/
