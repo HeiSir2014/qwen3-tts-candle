@@ -58,7 +58,9 @@ jobs:
             # Static CRT: no Visual C++ Redistributable needed on the user's machine.
             rustflags: -C target-feature=+crt-static
           - label: windows-x64-cuda
-            os: windows-2025
+            # CUDA 13.0 nvcc supports up to VS 2022; windows-2025 ships VS 2026.
+            # 13.0 is kept over newer toolkits because its PTX loads on the oldest drivers.
+            os: windows-2022
             features: tts-server/cuda,qwen3-tts/cli
             cuda: "13.0.2"
     env:
