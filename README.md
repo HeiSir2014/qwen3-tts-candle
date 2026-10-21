@@ -60,7 +60,7 @@ Text ──→ [TalkerModel] ──→ semantic tokens (1 per frame)
 |-------|----------|--------------|
 | `*-macos-arm64-metal.tar.gz` | macOS, Apple Silicon | macOS 14+ |
 | `*-windows-x64-cpu.zip` | Windows x64 | none |
-| `*-windows-x64-cuda.zip` | Windows x64, NVIDIA GPU (sm_80+) | NVIDIA driver 580+ and CUDA 13 runtime (cuBLAS, cuRAND) on `PATH` |
+| `*-windows-x64-cuda.zip` | Windows x64, NVIDIA GPU (sm_80+) | NVIDIA driver 580+ and CUDA 13 runtime (cuBLAS, cuRAND, NVRTC) on `PATH` |
 
 The macOS binaries are not notarized. If downloaded through a browser, clear the quarantine flag:
 
